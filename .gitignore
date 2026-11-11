@@ -312,9 +312,25 @@ paket-files/
 # CodeRush personal settings
 .cr/personal
 
-# Python Tools for Visual Studio (PTVS)
-__pycache__/
-*.pyc
+# Python virtual environments & dependencies
+env/
+.venv/
+*/env/
+*/.venv/
+
+# AI / ML models & weights cache
+*.pt
+*.pth
+*.onnx
+.models_cache/
+*/.models_cache/
+
+# Processed output / test inputs
+sorted_output/
+*/sorted_output/
+input_photos/
+*/input_photos/
+
 
 # Cake - Uncomment if you are using it
 # tools/**
