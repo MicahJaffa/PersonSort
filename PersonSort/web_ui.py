@@ -928,7 +928,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <div class="modal-box">
       <div class="modal-header">
         <strong id="compare-title">Photo Preview</strong>
-        <button class="btn-secondary" onclick="closeCompareModal()">Close (Esc)</button>
+        <div style="display:flex; align-items:center; gap:10px;">
+          <button id="toggle-bbox-btn" class="btn-secondary" onclick="toggleBoundingBoxes()" style="border-color:rgba(16,185,129,0.5); color:#6ee7b7;">
+            Bounding Boxes: ON
+          </button>
+          <button class="btn-secondary" onclick="closeCompareModal()">Close (Esc)</button>
+        </div>
       </div>
       <div class="modal-body" id="compare-body"></div>
     </div>
@@ -939,6 +944,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     let currentView = '__ALL__';
     let currentModalData = null;
     let activeFaceId = null;
+    let showBoundingBoxes = true;
 
     const urlParams = new URLSearchParams(window.location.search);
     const returnUrl = urlParams.get('return_url');
@@ -1672,24 +1678,57 @@ INDEX_HTML = r"""<!DOCTYPE html>
         }
       }
 
+      const updateToggleBtnUI = () => {
+        const btn = document.getElementById('toggle-bbox-btn');
+        if (!btn) return;
+        btn.textContent = showBoundingBoxes ? 'Bounding Boxes: ON' : 'Bounding Boxes: OFF';
+        btn.style.borderColor = showBoundingBoxes ? 'rgba(16,185,129,0.5)' : 'var(--border)';
+        btn.style.color = showBoundingBoxes ? '#6ee7b7' : 'var(--muted)';
+      };
+      updateToggleBtnUI();
+
       body.innerHTML = `
         <div class="lightbox-stage-wrap">
           <div class="lightbox-stage">
             <img src="${data.photo_url}" alt="${data.photo_id}" />
-            <svg class="face-overlay-svg" viewBox="0 0 ${imgW} ${imgH}" preserveAspectRatio="xMidYMid meet">
+            <svg id="photo-bbox-svg" class="face-overlay-svg" viewBox="0 0 ${imgW} ${imgH}" preserveAspectRatio="xMidYMid meet" style="display:${showBoundingBoxes ? 'block' : 'none'};">
               ${svgBodyBoxesHtml}
               ${svgNumberBoxesHtml}
               ${svgBoxesHtml}
             </svg>
           </div>
-          <div style="font-size:0.84rem; color:var(--muted);">
-            ${boxes.length > 0
-              ? `Click on a face bounding box in the photo above to view its cropped reference face and top 5-10 closest matches.`
-              : `No face bounding boxes detected in this photo.`}
+          <div style="display:flex; align-items:center; justify-content:space-between; width:100%; max-width:900px; gap:12px; flex-wrap:wrap;">
+            <div style="font-size:0.84rem; color:var(--muted);">
+              ${boxes.length > 0
+                ? `Click on a face bounding box in the photo above to view its cropped reference face and top 5-10 closest matches.`
+                : `No face bounding boxes detected in this photo.`}
+            </div>
+            <label style="display:inline-flex; align-items:center; gap:8px; cursor:pointer; font-size:0.84rem; color:var(--text); user-select:none; background:#0f172a; padding:5px 10px; border-radius:6px; border:1px solid var(--border);">
+              <input type="checkbox" id="toggle-bbox-checkbox" ${showBoundingBoxes ? 'checked' : ''} onchange="toggleBoundingBoxes()" style="accent-color:var(--primary); cursor:pointer;" />
+              <span>Show Bounding Boxes</span>
+            </label>
           </div>
         </div>
         ${faceMatchesHtml}
       `;
+    }
+
+    function toggleBoundingBoxes() {
+      showBoundingBoxes = !showBoundingBoxes;
+      const svgEl = document.getElementById('photo-bbox-svg');
+      if (svgEl) {
+        svgEl.style.display = showBoundingBoxes ? 'block' : 'none';
+      }
+      const chkEl = document.getElementById('toggle-bbox-checkbox');
+      if (chkEl) {
+        chkEl.checked = showBoundingBoxes;
+      }
+      const btn = document.getElementById('toggle-bbox-btn');
+      if (btn) {
+        btn.textContent = showBoundingBoxes ? 'Bounding Boxes: ON' : 'Bounding Boxes: OFF';
+        btn.style.borderColor = showBoundingBoxes ? 'rgba(16,185,129,0.5)' : 'var(--border)';
+        btn.style.color = showBoundingBoxes ? '#6ee7b7' : 'var(--muted)';
+      }
     }
 
     function closeCompareModal() {
