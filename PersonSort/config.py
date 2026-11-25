@@ -74,7 +74,7 @@ def _load_dotenv_files() -> None:
 
 _load_dotenv_files()
 
-APP_VERSION: str = "1.0.1"
+APP_VERSION: str = "1.0.2"
 GITHUB_RELEASES_REPO: str = os.environ.get(
     "PERSONSORT_GITHUB_REPO", "MicahJaffa/PersonSort"
 ).strip()
