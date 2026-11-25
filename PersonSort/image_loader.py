@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Iterable
+import json
 import logging
+import os
+from pathlib import Path, PurePosixPath
+from typing import Iterable, Optional
 
 try:
     import numpy as np
@@ -37,14 +39,88 @@ IGNORED_FILENAMES: frozenset[str] = frozenset(
 )
 
 
+def is_supported_image_name(filename: str) -> bool:
+    """Return True if a filename (local or remote) has a supported image extension."""
+    if not filename:
+        return False
+    p = PurePosixPath(filename.replace("\\", "/"))
+    name = p.name
+    if not name or name.startswith("."):
+        return False
+    return (
+        p.suffix.lower() in SUPPORTED_EXTENSIONS
+        and name.lower() not in IGNORED_FILENAMES
+    )
+
+
 def is_supported_image(path: Path) -> bool:
     """Return True if `path` is a regular file with a supported image extension."""
-    return (
-        path.is_file()
-        and path.suffix.lower() in SUPPORTED_EXTENSIONS
-        and path.name.lower() not in IGNORED_FILENAMES
-        and not path.name.startswith(".")
-    )
+    return path.is_file() and is_supported_image_name(path.name)
+
+
+def detect_local_dropbox_root() -> Optional[Path]:
+    """
+    Detect the locally synced Dropbox desktop folder if installed on this machine.
+    Checks standard Dropbox Desktop `info.json` locations and `~/Dropbox`.
+    """
+    candidates: list[Path] = []
+    for env_var in ("LOCALAPPDATA", "APPDATA"):
+        val = os.environ.get(env_var, "").strip()
+        if val:
+            candidates.append(Path(val) / "Dropbox" / "info.json")
+    candidates.append(Path.home() / ".dropbox" / "info.json")
+
+    for info_path in candidates:
+        if not info_path.is_file():
+            continue
+        try:
+            data = json.loads(info_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        for account_key in ("personal", "business"):
+            section = data.get(account_key)
+            if isinstance(section, dict):
+                raw_path = section.get("path")
+                if isinstance(raw_path, str) and raw_path.strip():
+                    p = Path(raw_path.strip())
+                    if p.is_dir():
+                        return p
+
+    default_dir = Path.home() / "Dropbox"
+    if default_dir.is_dir():
+        return default_dir
+    return None
+
+
+def resolve_local_dropbox_file(
+    dropbox_path_display: str,
+    expected_size: Optional[int] = None,
+    local_root: Optional[Path] = None,
+) -> Optional[Path]:
+    """
+    Given a Dropbox path (e.g. '/Events/Game1/IMG_001.jpg'), resolve the matching
+    local synced file if it exists on disk and matches `expected_size`.
+    """
+    root = local_root if local_root is not None else detect_local_dropbox_root()
+    if root is None or not root.is_dir():
+        return None
+
+    rel = (dropbox_path_display or "").strip().replace("\\", "/").lstrip("/")
+    if not rel:
+        return None
+
+    candidate = root / Path(rel)
+    if not candidate.is_file():
+        return None
+
+    if expected_size is not None and expected_size > 0:
+        try:
+            if candidate.stat().st_size != expected_size:
+                return None
+        except OSError:
+            return None
+
+    return candidate
 
 
 def scan_images(root_dir: Path, recursive: bool = True) -> list[Path]:

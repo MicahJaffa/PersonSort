@@ -331,6 +331,26 @@ sorted_output/
 input_photos/
 */input_photos/
 
+# Local Dropbox user settings (tokens live in OS keyring)
+.personsort_dropbox.json
+*/.personsort_dropbox.json
+
+# Environment variable files
+.env
+.env.*
+*/.env
+*/.env.*
+!.env.example
+!*/.env.example
+
+# PyInstaller / Inno Setup packaging artifacts
+build/
+dist/
+packaging/build/
+packaging/dist/
+packaging/Output/
+packaging/build_env/
+
 
 # Cake - Uncomment if you are using it
 # tools/**

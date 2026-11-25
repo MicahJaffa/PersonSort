@@ -8,7 +8,7 @@ import re
 import shutil
 import tempfile
 import threading
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 import zipfile
 
 try:
@@ -22,7 +22,7 @@ except ImportError:
     cv2 = None  # type: ignore
 
 from body_jersey_detector import BodyJerseyDetector
-from config import SortConfig
+from config import SortConfig, has_downloaded_models
 from face_detector import FaceDetector, normalize_embedding
 from image_loader import crop_region, is_supported_image, load_image_bgr, save_image_bgr, scan_images
 from matcher import build_jersey_folders, compute_pairwise_photo_similarities, group_players
@@ -31,6 +31,7 @@ from organizer import (
     load_reference_profiles,
     natural_sort_key,
     organize_output,
+    organize_output_to_dropbox,
     print_summary_table,
 )
 
@@ -82,9 +83,16 @@ class CurationSession:
         self.edit_count: int = 0
         self.last_commit_summary: Optional[dict[str, Any]] = None
         self.last_commit_output_dir: Optional[str] = None
+        self.last_commit_destination_type: Optional[str] = None
+        self.source_type: str = "local"
+        self.source_dropbox_folder: str = ""
+        self.source_dropbox_shared_folder_id: str = ""
+        self.dropbox_entry_by_path: dict[Path, Any] = {}
+        self.dropbox_loaded_as_thumbnails: bool = False
         self._detector: Optional[FaceDetector] = None
         self._body_jersey_detector: Optional[BodyJerseyDetector] = None
         self._upload_dir: Optional[Path] = None
+        self._temp_dirs: list[Path] = []
 
         # Real-time progress bar state
         self._progress_lock = threading.Lock()
@@ -207,8 +215,19 @@ class CurationSession:
 
         return self.to_state_dict()
 
+    def _cleanup_temp_dirs(self) -> None:
+        """Delete temporary uploaded/downloaded batch directories to reclaim disk space."""
+        for temp_dir in self._temp_dirs:
+            try:
+                if temp_dir.exists():
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+            except OSError:
+                pass
+        self._temp_dirs.clear()
+        self._upload_dir = None
+
     def reset_to_home(self) -> dict[str, Any]:
-        """Return the session to the Homescreen."""
+        """Return the session to the Homescreen and clean up temporary downloaded files."""
         self.mode = "home"
         self.all_photos = []
         self.photo_by_id = {}
@@ -220,6 +239,12 @@ class CurationSession:
         self.jersey_folders = {}
         self.photo_dimensions = {}
         self.edit_count = 0
+        self.source_type = "local"
+        self.source_dropbox_folder = ""
+        self.source_dropbox_shared_folder_id = ""
+        self.dropbox_entry_by_path = {}
+        self.dropbox_loaded_as_thumbnails = False
+        self._cleanup_temp_dirs()
         return self.to_state_dict()
 
     def start_background_processing(
@@ -262,12 +287,136 @@ class CurationSession:
                 error=str(exc),
             )
 
+    def start_dropbox_processing(
+        self,
+        dropbox_manager: Any,
+        folder_path: str,
+        *,
+        enable_jersey_ocr: Optional[bool] = None,
+        use_thumbnails: bool = True,
+        shared_folder_id: Optional[str] = None,
+    ) -> None:
+        """Download photos from Dropbox (thumbnails or full-res) and scan them in the background."""
+        if enable_jersey_ocr is not None:
+            self.config.enable_jersey_ocr = bool(enable_jersey_ocr)
+
+        self._update_progress(
+            active=True,
+            stage="Listing photos in Dropbox folder...",
+            current=0,
+            total=1,
+            current_file="",
+            error=None,
+        )
+        thread = threading.Thread(
+            target=self._run_dropbox_worker,
+            args=(dropbox_manager, folder_path, bool(use_thumbnails), shared_folder_id),
+            daemon=True,
+        )
+        thread.start()
+
+    def _run_dropbox_worker(
+        self,
+        dropbox_manager: Any,
+        folder_path: str,
+        use_thumbnails: bool,
+        shared_folder_id: Optional[str],
+    ) -> None:
+        try:
+            self.process_dropbox_folder(
+                dropbox_manager=dropbox_manager,
+                folder_path=folder_path,
+                use_thumbnails=use_thumbnails,
+                shared_folder_id=shared_folder_id,
+            )
+            self._update_progress(
+                active=False,
+                stage="Complete",
+                current=len(self.all_photos),
+                total=len(self.all_photos),
+            )
+        except Exception as exc:
+            self._update_progress(
+                active=False,
+                stage="Error",
+                current=0,
+                total=0,
+                error=str(exc),
+            )
+
+    def process_dropbox_folder(
+        self,
+        dropbox_manager: Any,
+        folder_path: str,
+        *,
+        use_thumbnails: bool = True,
+        shared_folder_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Download supported photos from a Dropbox folder into a temp directory,
+        store immutable Dropbox file IDs, and run detection & grouping.
+        """
+        self._cleanup_temp_dirs()
+        ns_id = (
+            shared_folder_id.strip()
+            if shared_folder_id is not None
+            else dropbox_manager.shared_folder_id
+        )
+        entries = dropbox_manager.list_images_in_folder(
+            folder_path,
+            shared_folder_id=ns_id,
+            recursive=False,
+        )
+        if not entries:
+            raise ValueError(
+                f"No supported photos (.jpg, .png, .webp, .bmp) were found in Dropbox folder '{folder_path or '/'}'."
+            )
+
+        batch_dir = Path(tempfile.mkdtemp(prefix="personsort_dropbox_"))
+        self._temp_dirs.append(batch_dir)
+        self._upload_dir = batch_dir
+
+        def _dl_progress(done: int, total: int, filename: str) -> None:
+            mode_label = "thumbnails" if use_thumbnails else "photos"
+            self._update_progress(
+                active=True,
+                stage=f"Downloading {mode_label} from Dropbox ({done}/{total})...",
+                current=done,
+                total=total,
+                current_file=filename,
+            )
+
+        self._update_progress(
+            active=True,
+            stage=f"Downloading {len(entries)} photo(s) from Dropbox...",
+            current=0,
+            total=len(entries),
+        )
+
+        downloaded_pairs = dropbox_manager.download_images_to_dir(
+            entries,
+            batch_dir,
+            use_thumbnails=use_thumbnails,
+            progress_callback=_dl_progress,
+        )
+
+        image_paths = [local_p for local_p, _ in downloaded_pairs]
+        self.source_type = "dropbox"
+        self.source_dropbox_folder = folder_path or "/"
+        self.source_dropbox_shared_folder_id = ns_id
+        self.dropbox_entry_by_path = {local_p: entry for local_p, entry in downloaded_pairs}
+        self.dropbox_loaded_as_thumbnails = bool(use_thumbnails)
+
+        return self._run_detection_and_grouping(image_paths)
+
     def process_uploaded_files(self, saved_files: list[Path]) -> dict[str, Any]:
         """
         Extract any `.zip` archives among `saved_files`, scan all supported images,
         run InsightFace detection + Body/Jersey OCR + DBSCAN clustering, and switch to review mode.
         """
+        self._cleanup_temp_dirs()
         batch_dir = Path(tempfile.mkdtemp(prefix="personsort_upload_"))
+        self._temp_dirs.append(batch_dir)
         self._upload_dir = batch_dir
         extract_dir = batch_dir / "extracted"
         extract_dir.mkdir(parents=True, exist_ok=True)
@@ -288,13 +437,28 @@ class CurationSession:
             )
 
         image_paths.sort(key=lambda p: natural_sort_key(p.name))
+        self.source_type = "local"
+        self.source_dropbox_folder = ""
+        self.source_dropbox_shared_folder_id = ""
+        self.dropbox_entry_by_path = {}
+        self.dropbox_loaded_as_thumbnails = False
+        return self._run_detection_and_grouping(image_paths)
+
+    def _run_detection_and_grouping(self, image_paths: list[Path]) -> dict[str, Any]:
+        """Run face detection, optional jersey OCR, and DBSCAN grouping over `image_paths`."""
         total_imgs = len(image_paths)
         scan_jerseys = bool(self.config.enable_jersey_ocr)
-        stage_title = (
-            "Loading face & jersey recognition models..."
-            if scan_jerseys
-            else "Loading face recognition model..."
+        needs_models_download = (
+            (self._detector is None or (scan_jerseys and self._body_jersey_detector is None))
+            and has_downloaded_models(check_jersey=scan_jerseys)["needs_first_time_download"]
         )
+        if needs_models_download:
+            stage_title = "First-time setup: downloading AI models (this only happens once)..."
+        elif scan_jerseys:
+            stage_title = "Loading face & jersey recognition models..."
+        else:
+            stage_title = "Loading face recognition model..."
+
         self._update_progress(
             active=True,
             stage=stage_title,
@@ -306,6 +470,14 @@ class CurationSession:
             self._detector = FaceDetector(self.config)
         if scan_jerseys and self._body_jersey_detector is None:
             self._body_jersey_detector = BodyJerseyDetector(self.config)
+
+        # Warm up model downloads/init now while the clear model-loading status is displayed
+        if needs_models_download:
+            if hasattr(self._detector, "_ensure_initialized"):
+                self._detector._ensure_initialized()
+            if scan_jerseys and self._body_jersey_detector is not None:
+                self._body_jersey_detector._ensure_yolo()
+                self._body_jersey_detector._ensure_ocr()
 
         reference_profiles: dict[str, PlayerProfile] = {}
         if self.config.reference_dir is not None and self.config.reference_dir.exists():
@@ -976,15 +1148,11 @@ class CurationSession:
         result["body_boxes"] = body_boxes
         return result
 
-    def commit_to_disk(self) -> dict[str, Any]:
-        """
-        Write the curated virtual folders to real folders on disk in `config.output_dir`,
-        then reset the session back to the Homescreen (`mode = 'home'`).
-        """
+    def _build_export_profiles(self) -> dict[str, PlayerProfile]:
+        """Combine non-empty PlayerProfiles and any remaining unmerged JerseyFolders for export."""
         combined_profiles: dict[str, PlayerProfile] = {
             pid: prof for pid, prof in self.profiles.items() if prof.photo_count > 0
         }
-        # If any separate JerseyFolders remain unmerged when committing, also export them
         for jnum, jfold in self.jersey_folders.items():
             if jfold.photo_count > 0:
                 j_prof_id = f"Jersey_#{jnum}"
@@ -992,21 +1160,172 @@ class CurationSession:
                 for p in jfold.photo_paths:
                     j_prof.photo_paths.add(p)
                 combined_profiles[j_prof_id] = j_prof
+        return combined_profiles
 
-        unassigned = self.unassigned_photos
-        summary = organize_output(
-            profiles=combined_profiles,
-            unassigned_detections=[],
-            no_face_photos=unassigned,
-            total_photos_scanned=len(self.all_photos),
-            config=self.config,
+    def start_background_export(
+        self,
+        *,
+        destination_type: str = "local",
+        local_output_dir: Optional[str] = None,
+        dropbox_output_folder: Optional[str] = None,
+        file_mode: str = "copy",
+        dropbox_manager: Optional[Any] = None,
+        shared_folder_id: Optional[str] = None,
+    ) -> None:
+        """Export sorted folders to local disk or Dropbox on a background thread with progress updates."""
+        initial_stage = (
+            "Preparing Dropbox export..."
+            if destination_type == "dropbox"
+            else "Preparing local folder export..."
         )
-        print_summary_table(summary, self.config.output_dir)
-        self.last_commit_summary = summary
-        self.last_commit_output_dir = str(self.config.output_dir)
+        self._update_progress(
+            active=True,
+            stage=initial_stage,
+            current=0,
+            total=1,
+            current_file="",
+            error=None,
+        )
+        thread = threading.Thread(
+            target=self._run_export_worker,
+            kwargs={
+                "destination_type": destination_type,
+                "local_output_dir": local_output_dir,
+                "dropbox_output_folder": dropbox_output_folder,
+                "file_mode": file_mode,
+                "dropbox_manager": dropbox_manager,
+                "shared_folder_id": shared_folder_id,
+            },
+            daemon=True,
+        )
+        thread.start()
+
+    def _run_export_worker(
+        self,
+        *,
+        destination_type: str,
+        local_output_dir: Optional[str],
+        dropbox_output_folder: Optional[str],
+        file_mode: str,
+        dropbox_manager: Optional[Any],
+        shared_folder_id: Optional[str],
+    ) -> None:
+        def _export_progress(done: int, total: int, label: str) -> None:
+            self._update_progress(
+                active=True,
+                stage=label,
+                current=done,
+                total=max(1, total),
+                current_file="",
+            )
+
+        try:
+            self.commit_export(
+                destination_type=destination_type,
+                local_output_dir=local_output_dir,
+                dropbox_output_folder=dropbox_output_folder,
+                file_mode=file_mode,
+                dropbox_manager=dropbox_manager,
+                shared_folder_id=shared_folder_id,
+                progress_callback=_export_progress,
+            )
+            self._update_progress(
+                active=False,
+                stage="Complete",
+                current=1,
+                total=1,
+            )
+        except Exception as exc:
+            self._update_progress(
+                active=False,
+                stage="Error",
+                current=0,
+                total=0,
+                error=str(exc),
+            )
+
+    def commit_export(
+        self,
+        *,
+        destination_type: str = "local",
+        local_output_dir: Optional[str] = None,
+        dropbox_output_folder: Optional[str] = None,
+        file_mode: str = "copy",
+        dropbox_manager: Optional[Any] = None,
+        shared_folder_id: Optional[str] = None,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    ) -> dict[str, Any]:
+        """
+        Write curated folders either to a local folder (`destination_type='local'`) or
+        directly to Dropbox (`destination_type='dropbox'`), then clean up temp files and
+        return to the Homescreen (`mode = 'home'`).
+        """
+        combined_profiles = self._build_export_profiles()
+        unassigned = self.unassigned_photos
+        clean_mode = "move" if str(file_mode).lower() == "move" else "copy"
+        dest_kind = "dropbox" if str(destination_type).lower() == "dropbox" else "local"
+
+        if dest_kind == "dropbox":
+            if dropbox_manager is None:
+                raise ValueError("Dropbox manager is required to export to Dropbox.")
+            target_dbx = dropbox_output_folder
+            if target_dbx is None or not str(target_dbx).strip():
+                raise ValueError("Please select a destination Dropbox folder.")
+
+            ns_id = (
+                shared_folder_id
+                if shared_folder_id is not None
+                else (self.source_dropbox_shared_folder_id or None)
+            )
+            summary = organize_output_to_dropbox(
+                profiles=combined_profiles,
+                unassigned_detections=[],
+                no_face_photos=unassigned,
+                total_photos_scanned=len(self.all_photos),
+                config=self.config,
+                dropbox_manager=dropbox_manager,
+                dropbox_output_folder=str(target_dbx),
+                file_mode=clean_mode,
+                dropbox_entry_by_path=self.dropbox_entry_by_path,
+                shared_folder_id=ns_id,
+                progress_callback=progress_callback,
+            )
+            self.last_commit_summary = summary
+            self.last_commit_output_dir = str(summary["output_dir"])
+            self.last_commit_destination_type = "dropbox"
+        else:
+            out_dir = (
+                Path(local_output_dir).expanduser().resolve()
+                if local_output_dir and str(local_output_dir).strip()
+                else self.config.output_dir
+            )
+            summary = organize_output(
+                profiles=combined_profiles,
+                unassigned_detections=[],
+                no_face_photos=unassigned,
+                total_photos_scanned=len(self.all_photos),
+                config=self.config,
+                output_dir_override=out_dir,
+                file_mode=clean_mode,
+                dropbox_manager=dropbox_manager,
+                dropbox_entry_by_path=self.dropbox_entry_by_path,
+                dropbox_loaded_as_thumbnails=self.dropbox_loaded_as_thumbnails,
+                progress_callback=progress_callback,
+            )
+            print_summary_table(summary, out_dir)
+            self.last_commit_summary = summary
+            self.last_commit_output_dir = str(out_dir)
+            self.last_commit_destination_type = "local"
 
         self.reset_to_home()
         return self.to_state_dict()
+
+    def commit_to_disk(self) -> dict[str, Any]:
+        """
+        Write the curated virtual folders to real folders on disk in `config.output_dir`,
+        then reset the session back to the Homescreen (`mode = 'home'`).
+        """
+        return self.commit_export(destination_type="local")
 
     def _serialize_photo(
         self,
@@ -1133,8 +1452,17 @@ class CurationSession:
             for p in sorted(self.all_photos, key=lambda path: natural_sort_key(path.name))
         ]
 
+        dropbox_photo_ids = {
+            self._get_photo_id(p): entry.file_id
+            for p, entry in self.dropbox_entry_by_path.items()
+            if p in self.all_photos
+        }
+
         return {
             "mode": self.mode,
+            "source_type": self.source_type,
+            "source_dropbox_folder": self.source_dropbox_folder,
+            "dropbox_photo_ids": dropbox_photo_ids,
             "output_dir": str(self.config.output_dir),
             "total_photos": len(self.all_photos),
             "total_folders": len(folders_payload),
@@ -1148,4 +1476,5 @@ class CurationSession:
             "jersey_folders": jersey_folders_payload,
             "last_commit": self.last_commit_summary,
             "last_commit_output_dir": self.last_commit_output_dir,
+            "last_commit_destination_type": self.last_commit_destination_type,
         }

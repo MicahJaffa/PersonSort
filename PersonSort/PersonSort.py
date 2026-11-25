@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import os
+import sys
+
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
 import importlib.util
 import logging
 from pathlib import Path
 import subprocess
-import sys
 
 
 def _ensure_project_venv() -> None:
@@ -14,6 +21,9 @@ def _ensure_project_venv() -> None:
     If PersonSort is launched with a system Python that does not have `insightface`
     installed, automatically re-launch using `PersonSort/env/Scripts/python.exe` if present.
     """
+    if getattr(sys, "frozen", False):
+        return
+
     if importlib.util.find_spec("insightface") is not None:
         return
 

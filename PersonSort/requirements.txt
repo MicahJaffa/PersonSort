@@ -8,3 +8,6 @@ tqdm>=4.66.0
 # Phase 2 (Milestone 6 - Body Detection & Jersey Number OCR):
 ultralytics>=8.1.0
 easyocr>=1.7.1
+# Dropbox Integration (OAuth PKCE + Secure Token Storage):
+dropbox>=12.0.0
+keyring>=25.0.0

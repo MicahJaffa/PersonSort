@@ -4,12 +4,125 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import os
 from pathlib import Path
+import sys
 from typing import Optional, Sequence
 
+IS_FROZEN: bool = bool(getattr(sys, "frozen", False))
 PROJECT_DIR: Path = Path(__file__).resolve().parent
-DEFAULT_INPUT_DIR: Path = PROJECT_DIR / "input_photos"
-DEFAULT_OUTPUT_DIR: Path = PROJECT_DIR / "sorted_output"
+APP_RESOURCE_DIR: Path = (
+    Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+    if IS_FROZEN
+    else PROJECT_DIR
+)
+if IS_FROZEN:
+    if sys.platform.startswith("win"):
+        USER_DATA_DIR: Path = (
+            Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "PersonSort"
+        )
+    else:
+        USER_DATA_DIR = Path.home() / ".personsort"
+else:
+    USER_DATA_DIR = PROJECT_DIR
+
+MODELS_CACHE_DIR: Path = USER_DATA_DIR / ".models_cache"
+DEFAULT_INPUT_DIR: Path = USER_DATA_DIR / "input_photos"
+DEFAULT_OUTPUT_DIR: Path = (
+    Path.home() / "Pictures" / "PersonSort_Output"
+    if IS_FROZEN
+    else PROJECT_DIR / "sorted_output"
+)
+
+
+def _load_dotenv_files() -> None:
+    """Load key=value pairs from `.env` locations into `os.environ`."""
+    candidates: list[Path] = []
+    if IS_FROZEN:
+        candidates.append(Path(sys.executable).resolve().parent / ".env")
+    candidates.extend(
+        [
+            APP_RESOURCE_DIR / ".env",
+            PROJECT_DIR / ".env",
+            PROJECT_DIR.parent / ".env",
+        ]
+    )
+
+    seen: set[Path] = set()
+    for env_path in candidates:
+        resolved = env_path.resolve()
+        if resolved in seen or not resolved.is_file():
+            continue
+        seen.add(resolved)
+        try:
+            for raw_line in resolved.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip()
+                if key.startswith("export "):
+                    key = key[len("export "):].strip()
+                val = val.strip()
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in {"'", '"'}:
+                    val = val[1:-1]
+                if key:
+                    os.environ.setdefault(key, val)
+        except OSError:
+            pass
+
+
+_load_dotenv_files()
+
+APP_VERSION: str = "1.0.0"
+GITHUB_RELEASES_REPO: str = os.environ.get(
+    "PERSONSORT_GITHUB_REPO", "MicahJaffa/PersonSort"
+).strip()
+
+DROPBOX_APP_KEY: str = os.environ.get("PERSONSORT_DROPBOX_APP_KEY", "").strip()
+DROPBOX_SHARED_FOLDER_ID: str = os.environ.get("PERSONSORT_DROPBOX_SHARED_FOLDER_ID", "").strip()
+DROPBOX_CALLBACK_PATH: str = "/dropbox/callback"
+DROPBOX_SETTINGS_PATH: Path = USER_DATA_DIR / ".personsort_dropbox.json"
+DROPBOX_KEYRING_SERVICE: str = "PersonSort.Dropbox"
+DROPBOX_KEYRING_USERNAME: str = "oauth2_refresh_token"
+
+
+def _safe_has_glob(directory: Path, pattern: str) -> bool:
+    try:
+        return directory.is_dir() and any(directory.glob(pattern))
+    except OSError:
+        return False
+
+
+def _safe_is_file(file_path: Path) -> bool:
+    try:
+        return file_path.is_file()
+    except OSError:
+        return False
+
+
+def has_downloaded_models(check_jersey: bool = False) -> dict[str, bool]:
+    """
+    Check whether local AI model weights are already present on disk so first-time
+    runs can display a clear 'downloading AI models' notice.
+    """
+    face_dirs = [
+        Path.home() / ".insightface" / "models" / "buffalo_l",
+        MODELS_CACHE_DIR / "insightface" / "models" / "buffalo_l",
+        APP_RESOURCE_DIR / ".models_cache" / "insightface" / "models" / "buffalo_l",
+    ]
+    face_ready = any(_safe_has_glob(d, "*.onnx") for d in face_dirs)
+
+    cache_roots = [MODELS_CACHE_DIR, APP_RESOURCE_DIR / ".models_cache"]
+    yolo_ready = any(_safe_is_file(r / "yolov8n.pt") for r in cache_roots)
+    ocr_ready = any(_safe_has_glob(r / "easyocr", "*.pth") for r in cache_roots)
+    jersey_ready = yolo_ready and ocr_ready
+    needs_download = (not face_ready) or (bool(check_jersey) and not jersey_ready)
+    return {
+        "face_ready": face_ready,
+        "jersey_ready": jersey_ready,
+        "needs_first_time_download": needs_download,
+    }
 
 
 @dataclass
@@ -36,6 +149,8 @@ class SortConfig:
     self_test: bool = False          # Run built-in end-to-end pipeline self-test
     launch_ui: bool = True           # Start the interactive Web UI immediately by default
     ui_port: int = 8080              # Port for the local Web UI server
+    dropbox_app_key: str = DROPBOX_APP_KEY
+    dropbox_shared_folder_id: str = DROPBOX_SHARED_FOLDER_ID
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -146,6 +261,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="ui_port",
         help="HTTP port for the interactive Web UI server.",
     )
+    parser.add_argument(
+        "--dropbox-app-key",
+        type=str,
+        default=DROPBOX_APP_KEY,
+        dest="dropbox_app_key",
+        help="Dropbox OAuth 2 App Key (PKCE public client).",
+    )
+    parser.add_argument(
+        "--dropbox-shared-folder-id",
+        type=str,
+        default=DROPBOX_SHARED_FOLDER_ID,
+        dest="dropbox_shared_folder_id",
+        help="Optional Dropbox shared folder namespace ID to pin requests to.",
+    )
     return parser
 
 
@@ -168,4 +297,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> SortConfig:
         self_test=ns.self_test,
         launch_ui=ns.launch_ui,
         ui_port=ns.ui_port,
+        dropbox_app_key=ns.dropbox_app_key.strip(),
+        dropbox_shared_folder_id=ns.dropbox_shared_folder_id.strip(),
     )

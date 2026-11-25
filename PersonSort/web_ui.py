@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 import mimetypes
 import tempfile
@@ -13,7 +14,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from config import APP_VERSION, DROPBOX_CALLBACK_PATH
+from desktop_window import PersonSortControlWindow
+from dropbox_client import DropboxManager, DropboxPermissionError
 from session_state import CurationSession
+from updater import check_for_update
 
 
 INDEX_HTML = r"""<!DOCTYPE html>
@@ -88,7 +93,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       background: var(--panel);
       border: 1px solid var(--border);
       border-radius: 16px;
-      max-width: 660px;
+      max-width: 920px;
       width: 100%;
       padding: 34px;
       display: flex;
@@ -96,6 +101,111 @@ INDEX_HTML = r"""<!DOCTYPE html>
       gap: 22px;
       box-shadow: 0 20px 45px rgba(0, 0, 0, 0.35);
     }
+    .source-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+      gap: 18px;
+      align-items: stretch;
+    }
+    .source-card {
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 14px;
+    }
+    .source-card-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      font-size: 1rem;
+      font-weight: 700;
+    }
+    .dbx-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 5px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: #1e293b;
+      color: var(--text);
+      font-size: 0.8rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .dbx-pill:hover {
+      border-color: var(--primary);
+    }
+    .dbx-pill.connected {
+      border-color: rgba(16, 185, 129, 0.55);
+      background: rgba(16, 185, 129, 0.12);
+      color: #a7f3d0;
+    }
+    .update-pill {
+      display: none;
+      align-items: center;
+      padding: 5px 12px;
+      border-radius: 999px;
+      border: 1px solid rgba(16, 185, 129, 0.65);
+      background: rgba(16, 185, 129, 0.18);
+      color: #6ee7b7;
+      font-size: 0.8rem;
+      font-weight: 700;
+      text-decoration: none;
+      cursor: pointer;
+    }
+    .update-pill.visible { display: inline-flex; }
+    .version-tag {
+      font-size: 0.78rem;
+      color: var(--muted);
+      background: #111827;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 3px 9px;
+    }
+    details.dbx-advanced-details {
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 14px;
+    }
+    details.dbx-advanced-details summary {
+      cursor: pointer;
+      font-size: 0.86rem;
+      font-weight: 700;
+      color: #93c5fd;
+      user-select: none;
+    }
+    details.dbx-advanced-details[open] summary {
+      margin-bottom: 12px;
+    }
+    .dbx-warning-box {
+      background: rgba(245, 158, 11, 0.14);
+      border: 1px solid var(--warning);
+      color: #fde68a;
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 0.82rem;
+      line-height: 1.45;
+      display: none;
+    }
+    .dbx-warning-box.visible { display: block; }
+    .dbx-error-box {
+      background: rgba(239, 68, 68, 0.14);
+      border: 1px solid var(--danger);
+      color: #fecaca;
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 0.84rem;
+      line-height: 1.45;
+      display: none;
+    }
+    .dbx-error-box.visible { display: block; }
     .commit-success-banner {
       display: none;
       background: rgba(16, 185, 129, 0.15);
@@ -734,26 +844,155 @@ INDEX_HTML = r"""<!DOCTYPE html>
       box-shadow: 0 4px 14px rgba(16, 185, 129, 0.3);
     }
     .btn-commit:hover { filter: brightness(1.08); }
+
+    /* Dropbox Settings & Folder Picker Modals */
+    .overlay-modal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.84);
+      align-items: center;
+      justify-content: center;
+      z-index: 120;
+      padding: 18px;
+    }
+    .overlay-modal.open { display: flex; }
+    .dbx-input {
+      width: 100%;
+      background: #0b1120;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 9px 12px;
+      font-size: 0.9rem;
+      font-family: inherit;
+    }
+    .dbx-input:focus {
+      outline: none;
+      border-color: var(--primary);
+    }
+    .dbx-folder-list {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #0b1120;
+      max-height: 320px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+    }
+    .dbx-folder-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 14px;
+      border-bottom: 1px solid rgba(51, 65, 85, 0.6);
+      cursor: pointer;
+      gap: 12px;
+      font-size: 0.9rem;
+    }
+    .dbx-folder-row:last-child { border-bottom: none; }
+    .dbx-folder-row:hover { background: rgba(59, 130, 246, 0.14); }
+    .dbx-file-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 9px 14px;
+      border-bottom: 1px solid rgba(51, 65, 85, 0.45);
+      gap: 12px;
+      font-size: 0.88rem;
+      color: var(--text);
+    }
+    .dbx-file-row:last-child { border-bottom: none; }
+    .dbx-file-row.unsupported {
+      color: #fca5a5;
+      background: rgba(239, 68, 68, 0.12);
+      border-left: 3px solid var(--danger);
+    }
+    .dbx-badge-folder {
+      background: rgba(59, 130, 246, 0.22);
+      color: #93c5fd;
+      border: 1px solid rgba(59, 130, 246, 0.45);
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 0.72rem;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+    .dbx-badge-photo {
+      background: rgba(16, 185, 129, 0.18);
+      color: #6ee7b7;
+      border: 1px solid rgba(16, 185, 129, 0.4);
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 0.72rem;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+    .dbx-badge-unsupported {
+      background: rgba(239, 68, 68, 0.24);
+      color: #fecaca;
+      border: 1px solid var(--danger);
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 0.72rem;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+    .export-option-card {
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .export-option-card.selected {
+      border-color: var(--primary);
+      background: rgba(59, 130, 246, 0.08);
+    }
+    .dbx-shared-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 8px 12px;
+      background: #0b1120;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 0.84rem;
+    }
   </style>
 </head>
 <body>
   <header>
     <div class="brand">
       <span style="cursor:pointer;" onclick="backToHome()">PersonSort</span>
+      <span id="header-version-badge" class="version-tag">v1.0.0</span>
+      <a id="header-update-btn" class="update-pill" href="#" target="_blank" rel="noopener noreferrer">Update Available</a>
       <a id="crm-return-link" href="#" style="display:none; color:#93c5fd; font-size:0.85rem; text-decoration:none;">Return</a>
     </div>
-    <div class="header-stats" id="header-stats">Ready</div>
+    <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+      <button id="header-dropbox-btn" type="button" class="dbx-pill" onclick="openDropboxSettingsModal()">
+        Dropbox: Not Connected
+      </button>
+      <div class="header-stats" id="header-stats">Ready</div>
+      <button id="header-quit-btn" type="button" class="btn-small btn-remove" style="padding:6px 12px; font-size:0.8rem;" onclick="quitApp()">
+        Quit App
+      </button>
+    </div>
   </header>
 
-  <!-- ================= 1. HOMESCREEN (Upload .zip or Photos) ================= -->
+  <!-- ================= 1. HOMESCREEN (Upload .zip/Photos OR Pick Dropbox) ================= -->
   <div id="home-screen" class="active">
     <div class="home-card">
       <div id="commit-success-banner" class="commit-success-banner"></div>
 
       <div>
-        <h1 style="font-size:1.55rem; margin-bottom:6px;">Upload Photos to Group by Face</h1>
+        <h1 style="font-size:1.55rem; margin-bottom:6px;">Choose Photo Source to Group by Face</h1>
         <p style="color:var(--muted); font-size:0.94rem;">
-          Upload a <strong>.zip file</strong> of photos (or select multiple image files). PersonSort will detect faces, calculate similarity scores, and let you review and adjust folders before creating the real folders.
+          Upload local photos or a <strong>.zip file</strong>, or connect your shared <strong>Dropbox</strong> folder. PersonSort detects faces and jersey numbers, lets you review and adjust folders, and lets you export to either a local directory or Dropbox.
         </p>
       </div>
 
@@ -766,23 +1005,64 @@ INDEX_HTML = r"""<!DOCTYPE html>
         onchange="handleFileSelect(this.files)"
       />
 
-      <div
-        id="dropzone"
-        class="upload-dropzone"
-        onclick="document.getElementById('file-input').click()"
-        ondragover="event.preventDefault(); this.classList.add('dragover');"
-        ondragleave="this.classList.remove('dragover');"
-        ondrop="event.preventDefault(); this.classList.remove('dragover'); handleFileSelect(event.dataTransfer.files);"
-      >
-        <div style="font-size:1.08rem; font-weight:700;">
-          Click to Choose a .ZIP File or Photos (or Drag & Drop Here)
+      <div class="source-grid">
+        <!-- Card 1: Local Photos -->
+        <div class="source-card">
+          <div class="source-card-title">
+            <span>Local Photos</span>
+            <span class="badge">Offline Ready</span>
+          </div>
+          <div
+            id="dropzone"
+            class="upload-dropzone"
+            style="padding: 28px 18px;"
+            onclick="document.getElementById('file-input').click()"
+            ondragover="event.preventDefault(); this.classList.add('dragover');"
+            ondragleave="this.classList.remove('dragover');"
+            ondrop="event.preventDefault(); this.classList.remove('dragover'); handleFileSelect(event.dataTransfer.files);"
+          >
+            <div style="font-size:1.02rem; font-weight:700;">
+              Click to Choose a .ZIP File or Photos (or Drag & Drop Here)
+            </div>
+            <div style="font-size:0.82rem; color:var(--muted);">
+              Supports <code>.zip</code> archives or multiple <code>.jpg</code>, <code>.png</code>, <code>.webp</code> images
+            </div>
+            <button type="button" class="btn-primary-large" style="margin-top:6px;">
+              Select .ZIP or Photos to Upload
+            </button>
+          </div>
         </div>
-        <div style="font-size:0.84rem; color:var(--muted);">
-          Supports <code>.zip</code> archives or multiple <code>.jpg</code>, <code>.png</code>, <code>.webp</code> images
+
+        <!-- Card 2: Dropbox Cloud -->
+        <div id="dropbox-source-card" class="source-card">
+          <div style="display:flex; flex-direction:column; gap:10px;">
+            <div class="source-card-title">
+              <span>Dropbox Cloud</span>
+              <span id="dbx-card-status-badge" class="badge">Not Connected</span>
+            </div>
+            <div id="dbx-account-line" style="font-size:0.84rem; color:var(--muted);">
+              Connect once with OAuth PKCE to browse shared team folders without re-logging in.
+            </div>
+            <div id="dbx-pinned-badge" style="display:none; font-size:0.78rem; color:#93c5fd; background:rgba(59,130,246,0.12); border:1px solid rgba(59,130,246,0.35); border-radius:6px; padding:6px 10px;"></div>
+            <div id="dropbox-permission-warning" class="dbx-warning-box"></div>
+            <div id="dbx-selected-input-box" style="display:none; background:#0b1120; border:1px solid var(--border); border-radius:8px; padding:10px 12px; font-size:0.84rem;">
+              <div style="color:var(--muted); font-size:0.76rem; margin-bottom:3px;">Selected Dropbox Source Folder:</div>
+              <code id="dbx-selected-input-label" style="color:#6ee7b7; word-break:break-all;">No folder selected</code>
+            </div>
+            <div id="dbx-thumb-opt-row" style="display:none; background:#0b1120; border:1px solid var(--border); border-radius:8px; padding:8px 12px;">
+              <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:0.82rem; color:var(--text);">
+                <input type="checkbox" id="dbx-use-thumbnails-checkbox" checked style="width:16px; height:16px; cursor:pointer;" />
+                <span>Fast Thumbnail Scan (Recommended - full-res kept on Dropbox)</span>
+              </label>
+            </div>
+          </div>
+
+          <div id="dbx-card-actions" style="display:flex; gap:10px; flex-wrap:wrap; margin-top:6px;">
+            <button type="button" class="btn-primary-large" onclick="openDropboxSettingsModal()">
+              Configure Dropbox App
+            </button>
+          </div>
         </div>
-        <button type="button" class="btn-primary-large" style="margin-top:6px;">
-          Select .ZIP or Photos to Upload
-        </button>
       </div>
 
       <div style="display:flex; align-items:center; justify-content:space-between; background:#0f172a; padding:12px 16px; border-radius:10px; border:1px solid var(--border);">
@@ -805,10 +1085,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <span id="upload-status-detail" style="color:var(--muted); font-size:0.82rem;"></span>
       </div>
 
-      <div style="display:flex; justify-content:space-between; align-items:center; border-top:1px solid var(--border); padding-top:16px; flex-wrap:wrap; gap:10px;">
-        <span style="font-size:0.84rem; color:var(--muted);">
-          Output directory: <code id="home-output-dir" style="color:#cbd5e1;"></code>
-        </span>
+      <div style="display:flex; justify-content:space-between; align-items:center; border-top:1px solid var(--border); padding-top:16px; flex-wrap:wrap; gap:12px;">
+        <div style="display:flex; flex-direction:column; gap:4px; font-size:0.84rem; color:var(--muted);">
+          <span>
+            Local output directory: <code id="home-output-dir" style="color:#cbd5e1;"></code>
+          </span>
+          <span>
+            Dropbox output folder: <code id="home-dropbox-output-dir" style="color:#cbd5e1;">Not selected</code>
+          </span>
+        </div>
+        <button id="home-pick-dbx-output-btn" type="button" class="btn-secondary" style="display:none;" onclick="openDropboxBrowser('output')">
+          Pick Dropbox Output
+        </button>
       </div>
     </div>
   </div>
@@ -939,12 +1227,225 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- ================= 4. DROPBOX CONNECTION & SETTINGS MODAL ================= -->
+  <div id="dropbox-settings-modal" class="overlay-modal" onclick="if(event.target===this) closeDropboxSettingsModal()">
+    <div class="modal-box" style="max-width:680px;">
+      <div class="modal-header">
+        <strong>Dropbox Connection & Settings</strong>
+        <button class="btn-secondary" onclick="closeDropboxSettingsModal()">Close (Esc)</button>
+      </div>
+      <div class="modal-body" style="gap:16px;">
+        <div id="dbx-settings-error" class="dbx-error-box"></div>
+        <div id="dbx-settings-warning" class="dbx-warning-box"></div>
+
+        <details id="dbx-advanced-details" class="dbx-advanced-details">
+          <summary>Advanced Settings (App Key, Redirect URI, Shared Folder ID)</summary>
+          <div style="display:flex; flex-direction:column; gap:14px;">
+            <div style="background:#0b1120; border:1px solid var(--border); border-radius:8px; padding:10px 12px; display:flex; flex-direction:column; gap:6px;">
+              <span style="font-size:0.8rem; color:var(--muted); font-weight:600;">OAuth 2 Redirect URI (Add in Dropbox App Console -> Settings -> Redirect URIs):</span>
+              <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap;">
+                <code id="dbx-redirect-uri" style="color:#93c5fd; font-size:0.86rem; word-break:break-all;">http://localhost:8080/dropbox/callback</code>
+                <button type="button" class="btn-secondary" onclick="copyDropboxRedirectUri()">Copy</button>
+              </div>
+            </div>
+
+            <div style="display:flex; flex-direction:column; gap:6px;">
+              <label for="dbx-app-key-input" style="font-size:0.86rem; font-weight:600;">Dropbox App Key (PKCE Public Client - no App Secret needed)</label>
+              <input id="dbx-app-key-input" type="text" class="dbx-input" placeholder="e.g. abc123xyz456..." />
+            </div>
+
+            <div style="display:flex; flex-direction:column; gap:6px;">
+              <label for="dbx-shared-folder-input" style="font-size:0.86rem; font-weight:600;">Shared Folder Namespace ID (Optional - pins browsing & output to team shared folder)</label>
+              <input id="dbx-shared-folder-input" type="text" class="dbx-input" placeholder="Leave blank for personal root, or paste namespace ID" />
+            </div>
+          </div>
+        </details>
+
+        <div id="dbx-shared-folders-section" style="display:none; flex-direction:column; gap:8px; border-top:1px solid var(--border); padding-top:12px;">
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
+            <span style="font-size:0.84rem; color:var(--muted); font-weight:600;">Your Dropbox Shared Folders</span>
+            <button type="button" class="btn-secondary" onclick="loadSharedFoldersList()">Load My Shared Folders</button>
+          </div>
+          <div id="dbx-shared-folders-list" style="display:flex; flex-direction:column; gap:6px;"></div>
+        </div>
+
+        <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; border-top:1px solid var(--border); padding-top:14px;">
+          <div style="display:flex; gap:10px; flex-wrap:wrap;">
+            <button type="button" class="btn-secondary" onclick="saveDropboxSettings()">Save Settings</button>
+            <button id="dbx-modal-connect-btn" type="button" class="btn-primary-large" style="padding:8px 16px; font-size:0.88rem;" onclick="connectDropbox()">Connect Dropbox</button>
+            <button id="dbx-modal-disconnect-btn" type="button" class="btn-small btn-remove" style="display:none; padding:8px 14px; font-size:0.86rem;" onclick="disconnectDropbox()">Disconnect Dropbox</button>
+          </div>
+          <button type="button" class="btn-secondary" onclick="closeDropboxSettingsModal()">Close</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= 5. DROPBOX FOLDER PICKER MODAL ================= -->
+  <div id="dropbox-browser-modal" class="overlay-modal" style="z-index:130;" onclick="if(event.target===this) closeDropboxBrowser()">
+    <div class="modal-box" style="max-width:740px;">
+      <div class="modal-header">
+        <strong id="dbx-browser-title">Browse Dropbox Folders</strong>
+        <button class="btn-secondary" onclick="closeDropboxBrowser()">Close (Esc)</button>
+      </div>
+      <div class="modal-body" style="gap:14px;">
+        <div id="dbx-browser-error" class="dbx-error-box"></div>
+
+        <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; background:#0f172a; padding:10px 14px; border-radius:8px; border:1px solid var(--border);">
+          <div style="display:flex; flex-direction:column; gap:3px; min-width:0;">
+            <span id="dbx-browser-scope-label" style="font-size:0.74rem; color:#93c5fd; font-weight:700; text-transform:uppercase; letter-spacing:0.05em;">Scope: My Dropbox</span>
+            <code id="dbx-browser-path-label" style="font-size:0.9rem; color:#f8fafc; word-break:break-all;">/</code>
+          </div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button id="dbx-browser-up-btn" type="button" class="btn-secondary" onclick="navigateDropboxUp()">Back</button>
+            <button type="button" class="btn-secondary" onclick="refreshDropboxBrowser()">Refresh</button>
+            <button type="button" class="btn-secondary" onclick="promptCreateDropboxFolder()">+ New Folder</button>
+          </div>
+        </div>
+
+        <div id="dbx-browser-folder-list" class="dbx-folder-list"></div>
+
+        <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px; border-top:1px solid var(--border); padding-top:14px;">
+          <div style="font-size:0.86rem; color:var(--muted);">
+            <span id="dbx-browser-stats">0 photo(s) found here</span>
+          </div>
+          <div style="display:flex; gap:10px;">
+            <button type="button" class="btn-secondary" onclick="closeDropboxBrowser()">Cancel</button>
+            <button type="button" class="btn-commit" style="padding:9px 18px; font-size:0.9rem;" onclick="confirmDropboxFolderSelection()">Select This Folder</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= 6. SAVE SORTED PHOTOS (LOCAL OR DROPBOX) MODAL ================= -->
+  <div id="export-modal" class="overlay-modal" onclick="if(event.target===this && !isExporting) closeExportModal()">
+    <div class="modal-box" style="max-width:720px;">
+      <div class="modal-header">
+        <strong>Save Sorted Photos</strong>
+        <button class="btn-secondary" onclick="if(!isExporting) closeExportModal()">Close (Esc)</button>
+      </div>
+      <div class="modal-body" style="gap:16px;">
+        <div id="export-error" class="dbx-error-box"></div>
+
+        <p style="font-size:0.9rem; color:var(--muted);">
+          Choose where to create the sorted player folders: on your local computer or inside Dropbox.
+        </p>
+
+        <div id="export-card-local" class="export-option-card selected">
+          <label style="display:flex; align-items:center; gap:10px; cursor:pointer; font-weight:700; font-size:0.95rem;">
+            <input type="radio" name="export-dest-type" id="export-dest-local" value="local" checked onchange="updateExportDestUI()" style="width:17px; height:17px; accent-color:var(--primary);" />
+            <span>Save to Local Computer Folder</span>
+          </label>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <input id="export-local-dir" type="text" class="dbx-input" placeholder="C:\path\to\sorted_output" />
+            <button type="button" class="btn-secondary" style="white-space:nowrap;" onclick="browseLocalFolder()">Browse...</button>
+          </div>
+        </div>
+
+        <div id="export-card-dropbox" class="export-option-card">
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap;">
+            <label style="display:flex; align-items:center; gap:10px; cursor:pointer; font-weight:700; font-size:0.95rem;">
+              <input type="radio" name="export-dest-type" id="export-dest-dropbox" value="dropbox" onchange="updateExportDestUI()" style="width:17px; height:17px; accent-color:var(--primary);" />
+              <span>Save to Dropbox Folder</span>
+            </label>
+            <span id="export-dbx-status-line" style="font-size:0.8rem; color:var(--muted);">Checking Dropbox status...</span>
+          </div>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <input id="export-dropbox-dir" type="text" class="dbx-input" placeholder="/Sorted_Photos/Game_1" />
+            <button id="export-pick-dbx-btn" type="button" class="btn-secondary" style="white-space:nowrap;" onclick="openDropboxBrowser('export_output')">Pick Folder</button>
+            <button id="export-connect-dbx-btn" type="button" class="btn-primary-large" style="display:none; padding:8px 14px; font-size:0.84rem; white-space:nowrap;" onclick="connectDropbox()">Connect Dropbox</button>
+          </div>
+          <span id="export-cloud-hint" style="font-size:0.78rem; color:var(--muted);">
+            Photos sourced from Dropbox are organized cloud-to-cloud instantly; local photos are uploaded directly into each player folder.
+          </span>
+        </div>
+
+        <div style="background:#0f172a; border:1px solid var(--border); border-radius:10px; padding:12px 14px; display:flex; flex-direction:column; gap:8px;">
+          <strong style="font-size:0.86rem; color:#cbd5e1;">File Handling</strong>
+          <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:0.88rem;">
+            <input type="radio" name="export-file-mode" id="export-mode-copy" value="copy" checked style="accent-color:var(--primary);" />
+            <span>Copy photos (Keep original photos intact)</span>
+          </label>
+          <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:0.88rem;">
+            <input type="radio" name="export-file-mode" id="export-mode-move" value="move" style="accent-color:var(--primary);" />
+            <span>Move photos (Move directly into player folders)</span>
+          </label>
+        </div>
+
+        <div id="export-progress" class="upload-progress">
+          <div class="progress-header-row">
+            <span id="export-status-title">Exporting folders...</span>
+            <span id="export-status-pct">0%</span>
+          </div>
+          <div class="progress-track">
+            <div id="export-progress-fill" class="progress-fill"></div>
+          </div>
+          <span id="export-status-detail" style="color:var(--muted); font-size:0.82rem;"></span>
+        </div>
+
+        <div style="display:flex; justify-content:flex-end; gap:10px; border-top:1px solid var(--border); padding-top:14px;">
+          <button id="export-cancel-btn" type="button" class="btn-secondary" onclick="closeExportModal()">Cancel</button>
+          <button id="export-submit-btn" type="button" class="btn-commit" onclick="runExportFolders()">
+            Export & Create Folders
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= 7. FIRST-TIME CONNECT DROPBOX WELCOME POPUP ================= -->
+  <div id="first-run-dropbox-modal" class="overlay-modal" style="z-index:125;" onclick="if(event.target===this) dismissFirstRunDropboxModal()">
+    <div class="modal-box" style="max-width:520px;">
+      <div class="modal-header">
+        <strong>Welcome to PersonSort</strong>
+        <button class="btn-secondary" onclick="dismissFirstRunDropboxModal()">Close (Esc)</button>
+      </div>
+      <div class="modal-body" style="gap:16px;">
+        <p style="font-size:0.96rem; line-height:1.55; color:var(--text);">
+          Connect your Dropbox account once to access shared team folders and save sorted player folders directly in Dropbox.
+        </p>
+        <p style="font-size:0.86rem; line-height:1.5; color:var(--muted);">
+          Clicking <strong>Connect Dropbox</strong> will open Dropbox so you can sign in and click <strong>Allow</strong>. If you only want to sort photos stored on this computer, you can skip this step.
+        </p>
+        <div style="display:flex; justify-content:flex-end; gap:10px; flex-wrap:wrap; border-top:1px solid var(--border); padding-top:14px;">
+          <button type="button" class="btn-secondary" onclick="dismissFirstRunDropboxModal()">Use Local Files Only</button>
+          <button type="button" class="btn-primary-large" style="padding:10px 20px; font-size:0.94rem;" onclick="connectDropbox()">
+            Connect Dropbox
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= 8. SHUTDOWN CONFIRMATION OVERLAY ================= -->
+  <div id="shutdown-overlay" class="overlay-modal" style="z-index:999;">
+    <div class="modal-box" style="max-width:460px;">
+      <div class="modal-header">
+        <strong>PersonSort Has Closed</strong>
+      </div>
+      <div class="modal-body" style="gap:12px;">
+        <p style="font-size:0.95rem; line-height:1.5; color:var(--text);">
+          The PersonSort background app has stopped cleanly.
+        </p>
+        <p style="font-size:0.86rem; color:var(--muted);">
+          You may now close this browser tab.
+        </p>
+      </div>
+    </div>
+  </div>
+
   <script>
     let appState = null;
+    let dropboxStatus = null;
     let currentView = '__ALL__';
     let currentModalData = null;
     let activeFaceId = null;
     let showBoundingBoxes = true;
+    let dropboxBrowserMode = 'input';
+    let dropboxBrowserPath = '';
+    let dropboxBrowserParent = null;
+    let isExporting = false;
 
     const urlParams = new URLSearchParams(window.location.search);
     const returnUrl = urlParams.get('return_url');
@@ -955,7 +1456,25 @@ INDEX_HTML = r"""<!DOCTYPE html>
     }
 
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') closeCompareModal();
+      if (e.key === 'Escape') {
+        if (document.getElementById('dropbox-browser-modal').classList.contains('open')) {
+          closeDropboxBrowser();
+          return;
+        }
+        dismissFirstRunDropboxModal();
+        closeCompareModal();
+        closeDropboxSettingsModal();
+        if (!isExporting) closeExportModal();
+      }
+    });
+
+    window.addEventListener('message', async (event) => {
+      if (!event || !event.data || event.data.type !== 'personsort-dropbox-connected') {
+        return;
+      }
+      document.getElementById('first-run-dropbox-modal').classList.remove('open');
+      closeDropboxSettingsModal();
+      await loadDropboxStatus();
     });
 
     // Natural alphanumeric comparator in JS ('Player_2' < 'Player_10')
@@ -976,6 +1495,68 @@ INDEX_HTML = r"""<!DOCTYPE html>
     async function loadState() {
       appState = await apiCall('/api/state');
       render();
+      await loadDropboxStatus();
+      maybeShowFirstRunDropboxPopup();
+      checkForUpdates();
+    }
+
+    async function quitApp() {
+      if (appState && appState.mode === 'review') {
+        const proceed = confirm(
+          'Quit PersonSort? Any uncommitted folder edits in this review session will be lost.'
+        );
+        if (!proceed) return;
+      }
+      try {
+        await fetch('/api/shutdown', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}',
+        });
+      } catch (err) {
+        console.debug('Shutdown request finished:', err);
+      }
+      document.getElementById('shutdown-overlay').classList.add('open');
+      try {
+        window.close();
+      } catch (err) {
+        // Browsers may block closing a tab not opened by script; overlay informs user.
+      }
+    }
+
+    async function checkForUpdates() {
+      try {
+        const res = await fetch('/api/update-check');
+        if (!res.ok) return;
+        const info = await res.json();
+        const verEl = document.getElementById('header-version-badge');
+        if (verEl && info.current_version) {
+          verEl.textContent = `v${info.current_version}`;
+        }
+        const btn = document.getElementById('header-update-btn');
+        if (btn && info.update_available && info.release_url) {
+          btn.href = info.release_url;
+          btn.textContent = `Update Available (${info.latest_version})`;
+          btn.classList.add('visible');
+        }
+      } catch (err) {
+        console.debug('Update check skipped:', err);
+      }
+    }
+
+    function maybeShowFirstRunDropboxPopup() {
+      if (!appState || appState.mode !== 'home') return;
+      if (!dropboxStatus || !dropboxStatus.configured || dropboxStatus.connected) return;
+      if (sessionStorage.getItem('ps_skip_dbx_welcome') === '1') return;
+      document.getElementById('first-run-dropbox-modal').classList.add('open');
+    }
+
+    function dismissFirstRunDropboxModal() {
+      const el = document.getElementById('first-run-dropbox-modal');
+      if (el && el.classList.contains('open')) {
+        sessionStorage.setItem('ps_skip_dbx_welcome', '1');
+        el.classList.remove('open');
+      }
     }
 
     function setProgressBar(pct, titleText, detailText) {
@@ -1040,6 +1621,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
         render();
       } catch (err) {
         console.error(err);
+        if (err && err.message) {
+          alert('Error: ' + err.message);
+        }
       } finally {
         prog.classList.remove('visible');
         document.getElementById('file-input').value = '';
@@ -1084,11 +1668,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
         const banner = document.getElementById('commit-success-banner');
         if (appState.last_commit) {
+          const destKindLabel = appState.last_commit_destination_type === 'dropbox'
+            ? 'Dropbox'
+            : 'Local Computer';
           banner.classList.add('visible');
           banner.innerHTML = `
             <strong>Real Player Folders Created Successfully</strong><br/>
-            Saved <strong>${appState.last_commit.total_players_grouped}</strong> player folder(s) (${appState.last_commit.photos_with_grouped_players} matched photos, ${appState.last_commit.no_face_photos_count} unassigned/no-face) to:<br/>
-            <code>${appState.last_commit_output_dir}</code>
+            Saved <strong>${appState.last_commit.total_players_grouped}</strong> player folder(s) (${appState.last_commit.photos_with_grouped_players} matched photos, ${appState.last_commit.no_face_photos_count} unassigned/no-face) to <strong>${destKindLabel}</strong>:<br/>
+            <code>${escapeHtml(appState.last_commit_output_dir || '')}</code>
           `;
         } else {
           banner.classList.remove('visible');
@@ -1747,9 +2334,756 @@ INDEX_HTML = r"""<!DOCTYPE html>
           return;
         }
       }
+      openExportModal();
+    }
 
-      appState = await apiCall('/api/commit', 'POST', {});
-      render();
+    function openExportModal() {
+      const errBox = document.getElementById('export-error');
+      errBox.classList.remove('visible');
+      errBox.textContent = '';
+      document.getElementById('export-progress').classList.remove('visible');
+
+      const localInput = document.getElementById('export-local-dir');
+      if (localInput && (!localInput.value || !localInput.value.trim())) {
+        localInput.value = (appState && appState.output_dir) ? appState.output_dir : '';
+      }
+
+      const dbxInput = document.getElementById('export-dropbox-dir');
+      if (dbxInput && (!dbxInput.value || !dbxInput.value.trim())) {
+        let defaultDbx = (dropboxStatus && dropboxStatus.selected_output_folder) ? dropboxStatus.selected_output_folder : '';
+        if (!defaultDbx && appState && appState.source_type === 'dropbox' && appState.source_dropbox_folder) {
+          const srcBase = appState.source_dropbox_folder === '/' ? '' : appState.source_dropbox_folder.replace(/\/+$/, '');
+          defaultDbx = `${srcBase}/Sorted`;
+        }
+        dbxInput.value = defaultDbx;
+      }
+
+      if (appState && appState.source_type === 'dropbox' && dropboxStatus && dropboxStatus.connected) {
+        document.getElementById('export-dest-dropbox').checked = true;
+      } else {
+        document.getElementById('export-dest-local').checked = true;
+      }
+
+      updateExportDestUI();
+      document.getElementById('export-modal').classList.add('open');
+    }
+
+    function closeExportModal() {
+      if (isExporting) return;
+      document.getElementById('export-modal').classList.remove('open');
+    }
+
+    function updateExportDestUI() {
+      const isDbx = document.getElementById('export-dest-dropbox').checked;
+      document.getElementById('export-card-local').classList.toggle('selected', !isDbx);
+      document.getElementById('export-card-dropbox').classList.toggle('selected', isDbx);
+
+      const dbxStatusLine = document.getElementById('export-dbx-status-line');
+      const pickBtn = document.getElementById('export-pick-dbx-btn');
+      const connectBtn = document.getElementById('export-connect-dbx-btn');
+      if (dropboxStatus && dropboxStatus.connected) {
+        dbxStatusLine.textContent = `Connected as ${dropboxStatus.account_name || 'Dropbox User'}`;
+        dbxStatusLine.style.color = '#6ee7b7';
+        pickBtn.style.display = 'inline-block';
+        connectBtn.style.display = 'none';
+      } else {
+        dbxStatusLine.textContent = 'Not connected to Dropbox';
+        dbxStatusLine.style.color = '#fcd34d';
+        pickBtn.style.display = 'none';
+        connectBtn.style.display = 'inline-block';
+      }
+    }
+
+    async function browseLocalFolder() {
+      const res = await fetch('/api/browse-local-folder', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ initial_dir: document.getElementById('export-local-dir').value || '' }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (data && data.path) {
+        document.getElementById('export-local-dir').value = data.path;
+        document.getElementById('export-dest-local').checked = true;
+        updateExportDestUI();
+      } else if (data && data.error) {
+        const errBox = document.getElementById('export-error');
+        errBox.textContent = data.error;
+        errBox.classList.add('visible');
+      }
+    }
+
+    async function runExportFolders() {
+      const errBox = document.getElementById('export-error');
+      errBox.classList.remove('visible');
+      const isDbx = document.getElementById('export-dest-dropbox').checked;
+      const localDir = (document.getElementById('export-local-dir').value || '').trim();
+      const dbxDir = (document.getElementById('export-dropbox-dir').value || '').trim();
+      const fileMode = document.getElementById('export-mode-move').checked ? 'move' : 'copy';
+
+      if (isDbx) {
+        if (!dropboxStatus || !dropboxStatus.connected) {
+          errBox.textContent = 'Please connect Dropbox first before saving to Dropbox.';
+          errBox.classList.add('visible');
+          return;
+        }
+        if (!dbxDir) {
+          errBox.textContent = 'Please choose or enter a Dropbox destination folder path.';
+          errBox.classList.add('visible');
+          return;
+        }
+      }
+
+      isExporting = true;
+      const progEl = document.getElementById('export-progress');
+      const fillEl = document.getElementById('export-progress-fill');
+      const titleEl = document.getElementById('export-status-title');
+      const pctEl = document.getElementById('export-status-pct');
+      const detailEl = document.getElementById('export-status-detail');
+      const submitBtn = document.getElementById('export-submit-btn');
+      const cancelBtn = document.getElementById('export-cancel-btn');
+
+      submitBtn.disabled = true;
+      cancelBtn.disabled = true;
+      progEl.classList.add('visible');
+      fillEl.style.width = '5%';
+      pctEl.textContent = '0%';
+      titleEl.textContent = isDbx ? 'Exporting to Dropbox...' : 'Exporting to Local Folder...';
+      detailEl.textContent = '';
+
+      try {
+        await apiCall('/api/export-start', 'POST', {
+          destination_type: isDbx ? 'dropbox' : 'local',
+          local_output_dir: localDir,
+          dropbox_output_folder: dbxDir,
+          file_mode: fileMode,
+        });
+
+        while (true) {
+          await new Promise(r => setTimeout(r, 200));
+          const p = await apiCall('/api/progress');
+          if (p.error) {
+            throw new Error(p.error);
+          }
+          const pct = Math.max(0, Math.min(100, p.percent || 0));
+          fillEl.style.width = `${pct}%`;
+          pctEl.textContent = `${Math.round(pct)}%`;
+          titleEl.textContent = p.stage || 'Exporting...';
+          detailEl.textContent = p.current_file || '';
+          if (!p.active) {
+            break;
+          }
+        }
+
+        fillEl.style.width = '100%';
+        pctEl.textContent = '100%';
+        titleEl.textContent = 'Export complete!';
+        isExporting = false;
+        document.getElementById('export-modal').classList.remove('open');
+        appState = await apiCall('/api/state');
+        render();
+      } catch (err) {
+        errBox.textContent = err.message || 'Export failed.';
+        errBox.classList.add('visible');
+      } finally {
+        isExporting = false;
+        submitBtn.disabled = false;
+        cancelBtn.disabled = false;
+        progEl.classList.remove('visible');
+      }
+    }
+
+    async function startDropboxScan() {
+      if (!dropboxStatus || !dropboxStatus.connected) {
+        openDropboxSettingsModal();
+        return;
+      }
+      const folderPath = dropboxStatus.selected_input_folder || '';
+      if (!folderPath) {
+        openDropboxBrowser('input');
+        return;
+      }
+
+      const scanJerseys = document.getElementById('scan-jerseys-checkbox')
+        ? document.getElementById('scan-jerseys-checkbox').checked
+        : true;
+      const useThumbnails = document.getElementById('dbx-use-thumbnails-checkbox')
+        ? document.getElementById('dbx-use-thumbnails-checkbox').checked
+        : true;
+
+      const prog = document.getElementById('upload-progress');
+      prog.classList.add('visible');
+      setProgressBar(2, 'Connecting to Dropbox...', folderPath);
+
+      try {
+        await apiCall('/api/dropbox/process', 'POST', {
+          folder_path: folderPath,
+          scan_jerseys: scanJerseys,
+          use_thumbnails: useThumbnails,
+        });
+
+        while (true) {
+          await new Promise(r => setTimeout(r, 200));
+          const p = await apiCall('/api/progress');
+          if (p.error) {
+            throw new Error(p.error);
+          }
+          const stageLower = (p.stage || '').toLowerCase();
+          const isDlStage = stageLower.includes('download') || stageLower.includes('listing');
+          const combinedPct = isDlStage
+            ? Math.round((p.percent || 0) * 0.25)
+            : 25 + Math.round((p.percent || 0) * 0.75);
+          setProgressBar(
+            combinedPct,
+            p.stage || 'Scanning Dropbox photos...',
+            p.current_file ? `Current photo: ${p.current_file} (${p.current}/${p.total})` : ''
+          );
+          if (!p.active) {
+            break;
+          }
+        }
+
+        setProgressBar(100, 'Complete!', '');
+        appState = await apiCall('/api/state');
+        currentView = '__ALL__';
+        render();
+      } catch (err) {
+        console.error(err);
+        if (err && err.message) {
+          alert('Error: ' + err.message);
+        }
+      } finally {
+        prog.classList.remove('visible');
+      }
+    }
+
+    function formatFileSize(bytes) {
+      const n = Number(bytes) || 0;
+      if (n < 1024) return `${n} B`;
+      if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+      return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+    }
+
+    function escapeHtml(value) {
+      return String(value || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    async function loadDropboxStatus() {
+      try {
+        const res = await fetch('/api/dropbox/status');
+        if (!res.ok) return;
+        dropboxStatus = await res.json();
+        renderDropboxStatus();
+      } catch (err) {
+        console.error('Failed to load Dropbox status:', err);
+      }
+    }
+
+    function renderDropboxStatus() {
+      if (!dropboxStatus) return;
+
+      const headerBtn = document.getElementById('header-dropbox-btn');
+      const cardBadge = document.getElementById('dbx-card-status-badge');
+      const accountLine = document.getElementById('dbx-account-line');
+      const pinnedBadge = document.getElementById('dbx-pinned-badge');
+      const warnBox = document.getElementById('dropbox-permission-warning');
+      const selectedInputBox = document.getElementById('dbx-selected-input-box');
+      const selectedInputLabel = document.getElementById('dbx-selected-input-label');
+      const actionsEl = document.getElementById('dbx-card-actions');
+      const homeDbxOutEl = document.getElementById('home-dropbox-output-dir');
+      const homePickOutBtn = document.getElementById('home-pick-dbx-output-btn');
+
+      const redirectEl = document.getElementById('dbx-redirect-uri');
+      if (redirectEl && dropboxStatus.redirect_uri) {
+        redirectEl.textContent = dropboxStatus.redirect_uri;
+      }
+
+      if (dropboxStatus.connected) {
+        const who = dropboxStatus.account_name || 'Connected';
+        headerBtn.textContent = `Dropbox: ${who}`;
+        headerBtn.classList.add('connected');
+        cardBadge.textContent = 'Connected';
+        cardBadge.style.background = 'rgba(16, 185, 129, 0.2)';
+        cardBadge.style.color = '#6ee7b7';
+
+        const thumbRow = document.getElementById('dbx-thumb-opt-row');
+        if (thumbRow) thumbRow.style.display = 'block';
+
+        const emailSuffix = dropboxStatus.account_email ? ` (${dropboxStatus.account_email})` : '';
+        accountLine.textContent = `Signed in as ${who}${emailSuffix}.`;
+        selectedInputBox.style.display = 'block';
+        selectedInputLabel.textContent = dropboxStatus.selected_input_folder || 'No folder selected';
+
+        homeDbxOutEl.textContent = dropboxStatus.selected_output_folder || 'Not selected';
+        homeDbxOutEl.style.color = dropboxStatus.selected_output_folder ? '#6ee7b7' : '#cbd5e1';
+        homePickOutBtn.style.display = 'inline-block';
+
+        const scanBtnHtml = dropboxStatus.selected_input_folder
+          ? `<button type="button" class="btn-commit" style="padding:10px 16px; font-size:0.9rem;" onclick="startDropboxScan()">Load & Scan Dropbox Folder</button>`
+          : '';
+
+        actionsEl.innerHTML = `
+          ${scanBtnHtml}
+          <button type="button" class="btn-primary-large" style="padding:10px 18px; font-size:0.9rem;" onclick="openDropboxBrowser('input')">
+            Browse Dropbox Folders
+          </button>
+          <button type="button" class="btn-secondary" onclick="openDropboxSettingsModal()">
+            Settings
+          </button>
+        `;
+      } else {
+        headerBtn.classList.remove('connected');
+        selectedInputBox.style.display = 'none';
+        const thumbRow = document.getElementById('dbx-thumb-opt-row');
+        if (thumbRow) thumbRow.style.display = 'none';
+        homeDbxOutEl.textContent = dropboxStatus.selected_output_folder || 'Not selected';
+        homeDbxOutEl.style.color = '#cbd5e1';
+        homePickOutBtn.style.display = 'none';
+
+        if (!dropboxStatus.sdk_available) {
+          headerBtn.textContent = 'Dropbox: SDK Missing';
+          cardBadge.textContent = 'Setup Needed';
+          cardBadge.style.background = 'rgba(239, 68, 68, 0.2)';
+          cardBadge.style.color = '#fecaca';
+          accountLine.textContent = dropboxStatus.error || 'Install dropbox and keyring packages.';
+          actionsEl.innerHTML = `
+            <button type="button" class="btn-secondary" onclick="openDropboxSettingsModal()">
+              Settings
+            </button>
+          `;
+        } else if (dropboxStatus.configured) {
+          headerBtn.textContent = 'Dropbox: Ready to Connect';
+          cardBadge.textContent = 'Not Connected';
+          cardBadge.style.background = 'var(--panel-hover)';
+          cardBadge.style.color = 'var(--text)';
+          accountLine.textContent = 'App Key saved. Sign in once with Dropbox to browse team shared folders.';
+          actionsEl.innerHTML = `
+            <button type="button" class="btn-primary-large" style="padding:10px 18px; font-size:0.9rem;" onclick="connectDropbox()">
+              Connect Dropbox
+            </button>
+            <button type="button" class="btn-secondary" onclick="openDropboxSettingsModal()">
+              Settings
+            </button>
+          `;
+        } else {
+          headerBtn.textContent = 'Dropbox: Not Configured';
+          cardBadge.textContent = 'Not Configured';
+          cardBadge.style.background = 'var(--panel-hover)';
+          cardBadge.style.color = 'var(--text)';
+          accountLine.textContent = 'Enter your Dropbox App Key once to connect your account or team shared folder.';
+          actionsEl.innerHTML = `
+            <button type="button" class="btn-primary-large" style="padding:10px 18px; font-size:0.9rem;" onclick="openDropboxSettingsModal()">
+              Configure Dropbox App
+            </button>
+          `;
+        }
+      }
+
+      if (dropboxStatus.shared_folder_id) {
+        pinnedBadge.style.display = 'block';
+        pinnedBadge.textContent = `Pinned Shared Folder Namespace: ${dropboxStatus.shared_folder_id}`;
+      } else {
+        pinnedBadge.style.display = 'none';
+      }
+
+      const warnText = dropboxStatus.permission_warning || '';
+      if (warnText) {
+        warnBox.textContent = warnText;
+        warnBox.classList.add('visible');
+      } else {
+        warnBox.classList.remove('visible');
+      }
+
+      // Sync Settings Modal state if open
+      const modalWarn = document.getElementById('dbx-settings-warning');
+      if (modalWarn) {
+        if (warnText) {
+          modalWarn.textContent = warnText;
+          modalWarn.classList.add('visible');
+        } else {
+          modalWarn.classList.remove('visible');
+        }
+      }
+      const sharedSection = document.getElementById('dbx-shared-folders-section');
+      const modalConnectBtn = document.getElementById('dbx-modal-connect-btn');
+      const modalDisconnectBtn = document.getElementById('dbx-modal-disconnect-btn');
+      if (sharedSection && modalConnectBtn && modalDisconnectBtn) {
+        sharedSection.style.display = dropboxStatus.connected ? 'flex' : 'none';
+        modalConnectBtn.style.display = dropboxStatus.connected ? 'none' : 'inline-block';
+        modalDisconnectBtn.style.display = dropboxStatus.connected ? 'inline-block' : 'none';
+      }
+      if (document.getElementById('export-modal') && document.getElementById('export-modal').classList.contains('open')) {
+        updateExportDestUI();
+      }
+    }
+
+    function openDropboxSettingsModal() {
+      const errBox = document.getElementById('dbx-settings-error');
+      errBox.classList.remove('visible');
+      errBox.textContent = '';
+
+      const advDetails = document.getElementById('dbx-advanced-details');
+      if (dropboxStatus) {
+        document.getElementById('dbx-app-key-input').value = dropboxStatus.app_key || '';
+        document.getElementById('dbx-shared-folder-input').value = dropboxStatus.shared_folder_id || '';
+        if (dropboxStatus.redirect_uri) {
+          document.getElementById('dbx-redirect-uri').textContent = dropboxStatus.redirect_uri;
+        }
+        if (advDetails) {
+          advDetails.open = !dropboxStatus.configured;
+        }
+        renderDropboxStatus();
+      } else if (advDetails) {
+        advDetails.open = false;
+      }
+      document.getElementById('dbx-shared-folders-list').innerHTML = '';
+      document.getElementById('dropbox-settings-modal').classList.add('open');
+    }
+
+    function closeDropboxSettingsModal() {
+      document.getElementById('dropbox-settings-modal').classList.remove('open');
+    }
+
+    async function copyDropboxRedirectUri() {
+      const text = document.getElementById('dbx-redirect-uri').textContent || '';
+      if (navigator.clipboard && text) {
+        try {
+          await navigator.clipboard.writeText(text);
+        } catch (err) {
+          console.error(err);
+        }
+      }
+    }
+
+    async function saveDropboxSettings(silent = false) {
+      const errBox = document.getElementById('dbx-settings-error');
+      errBox.classList.remove('visible');
+      const appKey = (document.getElementById('dbx-app-key-input').value || '').trim();
+      const sharedFolderId = (document.getElementById('dbx-shared-folder-input').value || '').trim();
+
+      const res = await fetch('/api/dropbox/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          app_key: appKey,
+          shared_folder_id: sharedFolderId,
+        }),
+      });
+      const data = await res.json().catch(() => ({ error: res.statusText }));
+      if (!res.ok) {
+        errBox.textContent = data.error || 'Failed to save Dropbox settings.';
+        errBox.classList.add('visible');
+        throw new Error(data.error || 'Failed to save Dropbox settings.');
+      }
+      dropboxStatus = data;
+      renderDropboxStatus();
+      if (!silent) {
+        closeDropboxSettingsModal();
+      }
+      return dropboxStatus;
+    }
+
+    async function connectDropbox() {
+      const errBox = document.getElementById('dbx-settings-error');
+      if (errBox) {
+        errBox.classList.remove('visible');
+      }
+
+      try {
+        const modalOpen = document.getElementById('dropbox-settings-modal').classList.contains('open');
+        if (modalOpen) {
+          await saveDropboxSettings(true);
+        }
+
+        const res = await fetch('/api/dropbox/auth-url', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+        const data = await res.json().catch(() => ({ error: res.statusText }));
+        if (!res.ok) {
+          const msg = data.error || 'Unable to start Dropbox OAuth flow.';
+          if (modalOpen && errBox) {
+            errBox.textContent = msg;
+            errBox.classList.add('visible');
+          } else {
+            alert(msg);
+          }
+          return;
+        }
+        const width = 620;
+        const height = 740;
+        const left = Math.max(0, Math.round(window.screenX + (window.outerWidth - width) / 2));
+        const top = Math.max(0, Math.round(window.screenY + (window.outerHeight - height) / 2));
+        const popup = window.open(
+          data.auth_url,
+          'personsort_dropbox_oauth',
+          `width=${width},height=${height},left=${left},top=${top},resizable=yes,scrollbars=yes`
+        );
+        if (!popup || popup.closed || typeof popup.closed === 'undefined') {
+          window.location.href = data.auth_url;
+        } else {
+          popup.focus();
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    async function disconnectDropbox() {
+      if (!confirm('Disconnect Dropbox and remove your saved sign-in token from this computer?')) {
+        return;
+      }
+      dropboxStatus = await apiCall('/api/dropbox/disconnect', 'POST', {});
+      document.getElementById('dbx-shared-folders-list').innerHTML = '';
+      renderDropboxStatus();
+    }
+
+    async function loadSharedFoldersList() {
+      const listEl = document.getElementById('dbx-shared-folders-list');
+      const errBox = document.getElementById('dbx-settings-error');
+      errBox.classList.remove('visible');
+      listEl.innerHTML = '<div style="color:var(--muted); font-size:0.84rem;">Loading shared folders...</div>';
+
+      const res = await fetch('/api/dropbox/shared-folders');
+      const data = await res.json().catch(() => ({ error: res.statusText }));
+      if (!res.ok) {
+        listEl.innerHTML = '';
+        errBox.textContent = data.error || 'Failed to load shared folders.';
+        errBox.classList.add('visible');
+        return;
+      }
+
+      const items = data.shared_folders || [];
+      if (items.length === 0) {
+        listEl.innerHTML = '<div style="color:var(--muted); font-size:0.84rem;">No shared folders found on this Dropbox account.</div>';
+        return;
+      }
+
+      listEl.innerHTML = '';
+      for (const sf of items) {
+        const row = document.createElement('div');
+        row.className = 'dbx-shared-item';
+
+        const infoDiv = document.createElement('div');
+        infoDiv.style.display = 'flex';
+        infoDiv.style.flexDirection = 'column';
+        infoDiv.innerHTML = `<strong>${escapeHtml(sf.name)}</strong><span style="color:var(--muted); font-size:0.76rem;">ID: ${escapeHtml(sf.shared_folder_id)}</span>`;
+
+        const pinBtn = document.createElement('button');
+        pinBtn.type = 'button';
+        pinBtn.className = 'btn-secondary';
+        pinBtn.textContent = sf.is_pinned ? 'Pinned' : 'Pin';
+        pinBtn.onclick = async () => {
+          document.getElementById('dbx-shared-folder-input').value = sf.shared_folder_id;
+          await saveDropboxSettings(true);
+          await loadSharedFoldersList();
+        };
+
+        row.appendChild(infoDiv);
+        row.appendChild(pinBtn);
+        listEl.appendChild(row);
+      }
+    }
+
+    async function openDropboxBrowser(mode = 'input') {
+      dropboxBrowserMode = mode;
+      const titleEl = document.getElementById('dbx-browser-title');
+      titleEl.textContent = (mode === 'output' || mode === 'export_output')
+        ? 'Choose Dropbox Output Folder'
+        : 'Choose Dropbox Source Folder';
+
+      let startPath = '';
+      if (mode === 'export_output') {
+        const currentExportPath = (document.getElementById('export-dropbox-dir').value || '').trim();
+        startPath = currentExportPath === '/' ? '' : currentExportPath;
+      } else if (dropboxStatus) {
+        const existing = mode === 'output'
+          ? (dropboxStatus.selected_output_folder || '')
+          : (dropboxStatus.selected_input_folder || '');
+        startPath = existing === '/' ? '' : existing;
+      }
+
+      document.getElementById('dropbox-browser-modal').classList.add('open');
+      await browseDropboxPath(startPath);
+    }
+
+    function closeDropboxBrowser() {
+      document.getElementById('dropbox-browser-modal').classList.remove('open');
+    }
+
+    async function refreshDropboxBrowser() {
+      await browseDropboxPath(dropboxBrowserPath);
+    }
+
+    async function navigateDropboxUp() {
+      if (dropboxBrowserParent === null || dropboxBrowserParent === undefined) return;
+      await browseDropboxPath(dropboxBrowserParent);
+    }
+
+    async function browseDropboxPath(path) {
+      const errBox = document.getElementById('dbx-browser-error');
+      const listEl = document.getElementById('dbx-browser-folder-list');
+      const statsEl = document.getElementById('dbx-browser-stats');
+      const pathLabel = document.getElementById('dbx-browser-path-label');
+      const scopeLabel = document.getElementById('dbx-browser-scope-label');
+      const upBtn = document.getElementById('dbx-browser-up-btn');
+
+      errBox.classList.remove('visible');
+      listEl.innerHTML = '<div style="padding:16px; color:var(--muted); font-size:0.86rem;">Loading Dropbox folders...</div>';
+
+      const res = await fetch(`/api/dropbox/folders?path=${encodeURIComponent(path || '')}`);
+      const data = await res.json().catch(() => ({ error: res.statusText }));
+      if (!res.ok) {
+        listEl.innerHTML = '';
+        errBox.textContent = data.error || 'Unable to list Dropbox folder.';
+        errBox.classList.add('visible');
+        return;
+      }
+
+      dropboxBrowserPath = data.current_path || '';
+      dropboxBrowserParent = data.parent_path;
+
+      scopeLabel.textContent = data.shared_folder_id
+        ? `Scope: Pinned Shared Folder (${data.shared_folder_id})`
+        : 'Scope: My Dropbox';
+      pathLabel.textContent = dropboxBrowserPath || '/';
+      upBtn.disabled = dropboxBrowserParent === null || dropboxBrowserParent === undefined;
+      upBtn.style.opacity = upBtn.disabled ? '0.45' : '1';
+
+      const folders = data.folders || [];
+      const files = data.files || [];
+      const unsupportedCount = files.filter(f => !f.is_supported_image).length;
+      statsEl.textContent = unsupportedCount > 0
+        ? `${data.image_count} supported photo(s), ${unsupportedCount} non-photo file(s) (highlighted in red)`
+        : `${data.image_count} supported photo(s) found here`;
+
+      if (folders.length === 0 && files.length === 0) {
+        listEl.innerHTML = '<div style="padding:16px; color:var(--muted); font-size:0.86rem;">This folder is empty.</div>';
+        return;
+      }
+
+      listEl.innerHTML = '';
+      for (const f of folders) {
+        const row = document.createElement('div');
+        row.className = 'dbx-folder-row';
+        row.onclick = () => browseDropboxPath(f.path_display || f.path_lower);
+
+        const leftWrap = document.createElement('div');
+        leftWrap.style.display = 'flex';
+        leftWrap.style.alignItems = 'center';
+        leftWrap.style.gap = '10px';
+        leftWrap.style.minWidth = '0';
+
+        const folderBadge = document.createElement('span');
+        folderBadge.className = 'dbx-badge-folder';
+        folderBadge.textContent = 'Folder';
+
+        const nameSpan = document.createElement('span');
+        nameSpan.textContent = f.name;
+        nameSpan.style.fontWeight = '600';
+
+        leftWrap.appendChild(folderBadge);
+        leftWrap.appendChild(nameSpan);
+
+        const pathSpan = document.createElement('span');
+        pathSpan.textContent = f.path_display || f.path_lower || '';
+        pathSpan.style.color = 'var(--muted)';
+        pathSpan.style.fontSize = '0.78rem';
+
+        row.appendChild(leftWrap);
+        row.appendChild(pathSpan);
+        listEl.appendChild(row);
+      }
+
+      for (const file of files) {
+        const row = document.createElement('div');
+        row.className = file.is_supported_image ? 'dbx-file-row' : 'dbx-file-row unsupported';
+
+        const leftWrap = document.createElement('div');
+        leftWrap.style.display = 'flex';
+        leftWrap.style.alignItems = 'center';
+        leftWrap.style.gap = '10px';
+        leftWrap.style.minWidth = '0';
+
+        const fileBadge = document.createElement('span');
+        fileBadge.className = file.is_supported_image ? 'dbx-badge-photo' : 'dbx-badge-unsupported';
+        fileBadge.textContent = file.is_supported_image ? 'Photo' : 'Not a Photo';
+
+        const nameSpan = document.createElement('span');
+        nameSpan.textContent = file.name;
+        nameSpan.style.wordBreak = 'break-all';
+
+        leftWrap.appendChild(fileBadge);
+        leftWrap.appendChild(nameSpan);
+
+        const sizeSpan = document.createElement('span');
+        sizeSpan.textContent = formatFileSize(file.size);
+        sizeSpan.style.fontSize = '0.76rem';
+        sizeSpan.style.color = file.is_supported_image ? 'var(--muted)' : '#fca5a5';
+        sizeSpan.style.flexShrink = '0';
+
+        row.appendChild(leftWrap);
+        row.appendChild(sizeSpan);
+        listEl.appendChild(row);
+      }
+    }
+
+    async function promptCreateDropboxFolder() {
+      const folderName = prompt('Enter name for the new Dropbox folder:');
+      if (!folderName || !folderName.trim()) return;
+      const cleaned = folderName.trim().replace(/^\/+|\/+$/g, '');
+      if (!cleaned) return;
+      const targetPath = dropboxBrowserPath ? `${dropboxBrowserPath}/${cleaned}` : `/${cleaned}`;
+
+      const errBox = document.getElementById('dbx-browser-error');
+      errBox.classList.remove('visible');
+
+      const res = await fetch('/api/dropbox/create-folder', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: targetPath }),
+      });
+      const data = await res.json().catch(() => ({ error: res.statusText }));
+      if (!res.ok) {
+        errBox.textContent = data.error || 'Could not create Dropbox folder.';
+        errBox.classList.add('visible');
+        return;
+      }
+      await refreshDropboxBrowser();
+    }
+
+    async function confirmDropboxFolderSelection() {
+      const chosen = dropboxBrowserPath || '/';
+      if (dropboxBrowserMode === 'export_output') {
+        const exportInput = document.getElementById('export-dropbox-dir');
+        if (exportInput) exportInput.value = chosen;
+        document.getElementById('export-dest-dropbox').checked = true;
+        updateExportDestUI();
+      }
+      const payload = (dropboxBrowserMode === 'output' || dropboxBrowserMode === 'export_output')
+        ? { selected_output_folder: chosen }
+        : { selected_input_folder: chosen };
+
+      const res = await fetch('/api/dropbox/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => ({ error: res.statusText }));
+      if (!res.ok) {
+        const errBox = document.getElementById('dbx-browser-error');
+        errBox.textContent = data.error || 'Failed to save selected folder.';
+        errBox.classList.add('visible');
+        return;
+      }
+      dropboxStatus = data;
+      renderDropboxStatus();
+      closeDropboxBrowser();
     }
 
     loadState();
@@ -1759,15 +3093,120 @@ INDEX_HTML = r"""<!DOCTYPE html>
 """
 
 
+def _render_oauth_callback_html(
+    title: str,
+    message: str,
+    *,
+    is_error: bool = False,
+    auto_redirect: bool = False,
+    auto_close_popup: bool = False,
+) -> str:
+    """Render a standalone dark-mode confirmation page for the OAuth 2 PKCE callback."""
+    safe_title = html.escape(title)
+    safe_msg = html.escape(message)
+    accent = "#ef4444" if is_error else "#10b981"
+    meta_refresh = (
+        '<meta http-equiv="refresh" content="2;url=/" />'
+        if (auto_redirect and not auto_close_popup)
+        else ""
+    )
+    if auto_close_popup:
+        auto_script = """
+  <script>
+    try {
+      if (window.opener && !window.opener.closed) {
+        window.opener.postMessage({ type: 'personsort-dropbox-connected' }, '*');
+        setTimeout(() => window.close(), 350);
+      } else {
+        setTimeout(() => { window.location.href = '/'; }, 600);
+      }
+    } catch (e) {
+      setTimeout(() => { window.location.href = '/'; }, 600);
+    }
+  </script>
+"""
+    elif auto_redirect:
+        auto_script = '<script>setTimeout(() => { window.location.href = "/"; }, 600);</script>'
+    else:
+        auto_script = ""
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  {meta_refresh}
+  <title>{safe_title} - PersonSort</title>
+  <style>
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f172a;
+      color: #f8fafc;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0;
+      padding: 20px;
+    }}
+    .card {{
+      background: #1e293b;
+      border: 1px solid {accent};
+      border-radius: 14px;
+      padding: 28px 32px;
+      max-width: 520px;
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      box-shadow: 0 20px 45px rgba(0, 0, 0, 0.45);
+    }}
+    .btn {{
+      display: inline-block;
+      background: #3b82f6;
+      color: #ffffff;
+      text-decoration: none;
+      padding: 10px 18px;
+      border-radius: 8px;
+      font-weight: 700;
+      text-align: center;
+      align-self: flex-start;
+    }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2 style="margin:0; color:{accent};">{safe_title}</h2>
+    <p style="margin:0; color:#cbd5e1; line-height:1.5;">{safe_msg}</p>
+    <a class="btn" href="/">Return to PersonSort</a>
+  </div>
+  {auto_script}
+</body>
+</html>
+"""
+
+
 class CurationRequestHandler(BaseHTTPRequestHandler):
     """HTTP handler serving the PersonSort Web UI and JSON REST endpoints with CORS enabled."""
 
     session: CurationSession
+    dropbox_manager: DropboxManager
+    server_port: int = 8080
     staging_files: list[Path] = []
     staging_dir: Path | None = None
 
     def log_message(self, format: str, *args: Any) -> None:
         pass
+
+    def _get_dropbox_redirect_uri(self) -> str:
+        return f"http://localhost:{self.server_port}{DROPBOX_CALLBACK_PATH}"
+
+    def _send_html(self, html_str: str, status: int = HTTPStatus.OK) -> None:
+        body = html_str.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _send_json(self, payload: Any, status: int = HTTPStatus.OK) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -1803,6 +3242,86 @@ class CurationRequestHandler(BaseHTTPRequestHandler):
 
         if route == "/api/state":
             self._send_json(self.session.to_state_dict())
+            return
+
+        if route == DROPBOX_CALLBACK_PATH:
+            flat_query = {k: v[0] for k, v in query.items() if v}
+            if "error" in flat_query:
+                desc = flat_query.get("error_description") or flat_query.get("error") or "Authorization cancelled."
+                self._send_html(
+                    _render_oauth_callback_html(
+                        "Dropbox Sign-In Cancelled",
+                        desc,
+                        is_error=True,
+                        auto_redirect=False,
+                    )
+                )
+                return
+
+            try:
+                status_data = self.dropbox_manager.finish_oauth_flow(
+                    flat_query,
+                    redirect_uri=self._get_dropbox_redirect_uri(),
+                )
+                who = status_data.get("account_name") or "Dropbox User"
+                warn = status_data.get("permission_warning")
+                extra = f" Note: {warn}" if warn else " Redirecting back to PersonSort..."
+                self._send_html(
+                    _render_oauth_callback_html(
+                        "Dropbox Connected",
+                        f"Signed in as {who}.{extra}",
+                        is_error=False,
+                        auto_redirect=True,
+                        auto_close_popup=True,
+                    )
+                )
+            except Exception as exc:
+                self._send_html(
+                    _render_oauth_callback_html(
+                        "Dropbox Connection Failed",
+                        str(exc),
+                        is_error=True,
+                        auto_redirect=False,
+                    ),
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+            return
+
+        if route == "/api/update-check":
+            self._send_json(check_for_update())
+            return
+
+        if route == "/api/dropbox/status":
+            self._send_json(
+                self.dropbox_manager.get_status(
+                    redirect_uri=self._get_dropbox_redirect_uri()
+                )
+            )
+            return
+
+        if route == "/api/dropbox/shared-folders":
+            try:
+                folders = self.dropbox_manager.list_shared_folders()
+                self._send_json({"shared_folders": folders})
+            except DropboxPermissionError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        if route == "/api/dropbox/folders":
+            path_arg = query.get("path", [""])[0]
+            ns_override = query["shared_folder_id"][0] if "shared_folder_id" in query else None
+            try:
+                listing = self.dropbox_manager.list_folder(
+                    path=path_arg,
+                    shared_folder_id=ns_override,
+                )
+                self._send_json(listing)
+            except DropboxPermissionError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
 
         if route == "/api/progress":
@@ -1904,6 +3423,50 @@ class CurationRequestHandler(BaseHTTPRequestHandler):
 
             data = json.loads(raw_body.decode("utf-8")) if raw_body else {}
 
+            if route == "/api/dropbox/settings":
+                state = self.dropbox_manager.update_settings(
+                    app_key=str(data["app_key"]) if "app_key" in data else None,
+                    shared_folder_id=str(data["shared_folder_id"]) if "shared_folder_id" in data else None,
+                    selected_input_folder=(
+                        str(data["selected_input_folder"])
+                        if "selected_input_folder" in data
+                        else None
+                    ),
+                    selected_output_folder=(
+                        str(data["selected_output_folder"])
+                        if "selected_output_folder" in data
+                        else None
+                    ),
+                    redirect_uri=self._get_dropbox_redirect_uri(),
+                )
+                self._send_json(state)
+                return
+
+            if route == "/api/dropbox/auth-url":
+                redirect_uri = self._get_dropbox_redirect_uri()
+                auth_url = self.dropbox_manager.start_oauth_flow(redirect_uri)
+                self._send_json({"auth_url": auth_url, "redirect_uri": redirect_uri})
+                return
+
+            if route == "/api/dropbox/disconnect":
+                state = self.dropbox_manager.disconnect(
+                    redirect_uri=self._get_dropbox_redirect_uri()
+                )
+                self._send_json(state)
+                return
+
+            if route == "/api/dropbox/create-folder":
+                ns_override = str(data["shared_folder_id"]) if "shared_folder_id" in data else None
+                try:
+                    created = self.dropbox_manager.create_folder(
+                        path=str(data.get("path", "")),
+                        shared_folder_id=ns_override,
+                    )
+                    self._send_json({"folder": created})
+                except DropboxPermissionError as exc:
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.FORBIDDEN)
+                return
+
             if route == "/api/remove":
                 state = self.session.remove_photo_from_folder(
                     photo_id=str(data.get("photo_id", "")),
@@ -1963,8 +3526,88 @@ class CurationRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(state)
                 return
 
+            if route == "/api/dropbox/process":
+                folder_path = (
+                    str(data["folder_path"])
+                    if "folder_path" in data
+                    else self.dropbox_manager.get_status(verify_shared_access=False).get("selected_input_folder", "")
+                )
+                if not str(folder_path).strip():
+                    raise ValueError("Please select a Dropbox source folder first.")
+                scan_jerseys = bool(data.get("scan_jerseys", True))
+                use_thumbnails = bool(data.get("use_thumbnails", True))
+                ns_override = str(data["shared_folder_id"]) if "shared_folder_id" in data else None
+                self.session.start_dropbox_processing(
+                    self.dropbox_manager,
+                    folder_path=str(folder_path),
+                    enable_jersey_ocr=scan_jerseys,
+                    use_thumbnails=use_thumbnails,
+                    shared_folder_id=ns_override,
+                )
+                self._send_json({"status": "processing_started"})
+                return
+
+            if route == "/api/browse-local-folder":
+                try:
+                    initial = str(data.get("initial_dir") or self.session.config.output_dir)
+                    picker = getattr(self.server, "local_folder_picker", None)
+                    if callable(picker):
+                        selected = picker(initial)
+                    else:
+                        import tkinter as tk
+                        from tkinter import filedialog
+
+                        root = tk.Tk()
+                        root.withdraw()
+                        root.attributes("-topmost", True)
+                        selected = filedialog.askdirectory(initialdir=initial, title="Choose Output Folder")
+                        root.destroy()
+                    self._send_json({"path": selected or ""})
+                except Exception as exc:
+                    self._send_json({"path": "", "error": f"Folder dialog unavailable: {exc}"})
+                return
+
+            if route == "/api/export-start":
+                dest_type = str(data.get("destination_type", "local"))
+                local_out = str(data["local_output_dir"]) if "local_output_dir" in data else None
+                dbx_out = str(data["dropbox_output_folder"]) if "dropbox_output_folder" in data else None
+                file_mode = str(data.get("file_mode", "copy"))
+                ns_override = str(data["shared_folder_id"]) if "shared_folder_id" in data else None
+                self.session.start_background_export(
+                    destination_type=dest_type,
+                    local_output_dir=local_out,
+                    dropbox_output_folder=dbx_out,
+                    file_mode=file_mode,
+                    dropbox_manager=self.dropbox_manager,
+                    shared_folder_id=ns_override,
+                )
+                self._send_json({"status": "export_started"})
+                return
+
+            if route == "/api/shutdown":
+                self.session._cleanup_temp_dirs()
+                self._send_json({"status": "shutting_down"})
+                on_shutdown = getattr(self.server, "on_shutdown_callback", None)
+                if callable(on_shutdown):
+                    threading.Timer(0.1, on_shutdown).start()
+                threading.Timer(0.15, self.server.shutdown).start()
+                return
+
             if route == "/api/commit":
-                result = self.session.commit_to_disk()
+                if any(
+                    k in data
+                    for k in ("destination_type", "local_output_dir", "dropbox_output_folder", "file_mode")
+                ):
+                    result = self.session.commit_export(
+                        destination_type=str(data.get("destination_type", "local")),
+                        local_output_dir=str(data["local_output_dir"]) if "local_output_dir" in data else None,
+                        dropbox_output_folder=str(data["dropbox_output_folder"]) if "dropbox_output_folder" in data else None,
+                        file_mode=str(data.get("file_mode", "copy")),
+                        dropbox_manager=self.dropbox_manager,
+                        shared_folder_id=str(data["shared_folder_id"]) if "shared_folder_id" in data else None,
+                    )
+                else:
+                    result = self.session.commit_to_disk()
                 self._send_json(result)
                 return
 
@@ -1977,6 +3620,7 @@ def create_http_server(
     session: CurationSession,
     host: str = "127.0.0.1",
     port: int = 8080,
+    dropbox_manager: DropboxManager | None = None,
 ) -> ThreadingHTTPServer:
     """Create a ThreadingHTTPServer bound to `(host, port)` for `session`."""
 
@@ -1984,7 +3628,45 @@ def create_http_server(
         pass
 
     BoundHandler.session = session
-    return ThreadingHTTPServer((host, port), BoundHandler)
+    BoundHandler.dropbox_manager = dropbox_manager or DropboxManager(session.config)
+    server = ThreadingHTTPServer((host, port), BoundHandler)
+    BoundHandler.server_port = server.server_address[1]
+    server.dropbox_manager = BoundHandler.dropbox_manager  # type: ignore[attr-defined]
+    server.on_shutdown_callback = None  # type: ignore[attr-defined]
+    server.local_folder_picker = None  # type: ignore[attr-defined]
+    return server
+
+
+def bind_http_server_with_fallback(
+    session: CurationSession,
+    host: str = "127.0.0.1",
+    preferred_port: int = 8080,
+    dropbox_manager: DropboxManager | None = None,
+) -> ThreadingHTTPServer:
+    """
+    Bind the local HTTP server to `preferred_port` or cleanly fall back to 8081, 8082,
+    or an ephemeral port if the default port is already in use.
+    """
+    candidates: list[int] = []
+    for port in (preferred_port, 8081, 8082, 0):
+        if port not in candidates:
+            candidates.append(port)
+
+    last_exc: OSError | None = None
+    for port in candidates:
+        try:
+            return create_http_server(
+                session,
+                host=host,
+                port=port,
+                dropbox_manager=dropbox_manager,
+            )
+        except OSError as exc:
+            last_exc = exc
+            continue
+    if last_exc is not None:
+        raise last_exc
+    return create_http_server(session, host=host, port=0, dropbox_manager=dropbox_manager)
 
 
 def launch_curation_ui(
@@ -1992,24 +3674,66 @@ def launch_curation_ui(
     host: str = "127.0.0.1",
     port: int = 8080,
     open_browser: bool = True,
+    show_control_window: bool = True,
 ) -> None:
-    """Start the local PersonSort Review UI server and optionally open the browser."""
-    server = create_http_server(session, host=host, port=port)
+    """Start the local PersonSort Review UI server and optionally show the desktop control window."""
+    server = bind_http_server_with_fallback(session, host=host, preferred_port=port)
     actual_port = server.server_address[1]
-    url = f"http://{host}:{actual_port}"
+    browser_host = "localhost" if host in ("127.0.0.1", "localhost") else host
+    url = f"http://{browser_host}:{actual_port}"
 
     print("\n" + "=" * 64)
-    print("  PersonSort Web UI is running!")
+    print(f"  PersonSort Web UI v{APP_VERSION} is running!")
     print(f"  Open in browser : {url}")
-    print("  Press Ctrl+C in the terminal to stop the server.")
+    print("  Close the PersonSort control window or click 'Quit App' to exit cleanly.")
     print("=" * 64 + "\n")
 
-    if open_browser:
-        threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+    window: PersonSortControlWindow | None = None
+    if show_control_window:
+        try:
+            window = PersonSortControlWindow(
+                url=url,
+                version=APP_VERSION,
+                on_quit=lambda: threading.Thread(target=server.shutdown, daemon=True).start(),
+                open_browser_on_start=open_browser,
+            )
+            server.on_shutdown_callback = window.request_close  # type: ignore[attr-defined]
+            server.local_folder_picker = window.ask_directory  # type: ignore[attr-defined]
+        except Exception as exc:
+            print(f"Control window unavailable ({exc}); running in console mode.")
+            window = None
 
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nShutting down PersonSort Web UI server...")
-    finally:
-        server.server_close()
+    if window is not None:
+        server_exited = threading.Event()
+
+        def _serve() -> None:
+            try:
+                server.serve_forever()
+            finally:
+                server_exited.set()
+
+        server_thread = threading.Thread(target=_serve, daemon=True)
+        server_thread.start()
+        try:
+            window.run()
+        except KeyboardInterrupt:
+            print("\nShutting down PersonSort Web UI server...")
+        finally:
+            if not server_exited.is_set():
+                try:
+                    server.shutdown()
+                except Exception:
+                    pass
+            server_thread.join(timeout=2.0)
+            session._cleanup_temp_dirs()
+            server.server_close()
+    else:
+        if open_browser:
+            threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\nShutting down PersonSort Web UI server...")
+        finally:
+            session._cleanup_temp_dirs()
+            server.server_close()

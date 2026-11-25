@@ -17,7 +17,7 @@ try:
 except ImportError:
     tqdm = None  # type: ignore
 
-from config import SortConfig
+from config import APP_RESOURCE_DIR, MODELS_CACHE_DIR, SortConfig
 from image_loader import load_image_bgr
 from models import BoundingBox, PlayerDetection
 
@@ -77,22 +77,69 @@ class FaceDetector:
                 if p in available_providers
             ]
             providers = preferred or ["CPUExecutionProvider"]
-            ctx_id = 0
         else:
             providers = ["CPUExecutionProvider"]
-            ctx_id = -1
+
+        has_gpu_provider = any(
+            p in {"CUDAExecutionProvider", "DmlExecutionProvider"}
+            for p in providers
+        )
+        ctx_id = 0 if has_gpu_provider else -1
+
+        bundled_root = APP_RESOURCE_DIR / ".models_cache" / "insightface"
+        writable_root = MODELS_CACHE_DIR / "insightface"
+        app_kwargs: dict[str, object] = {}
+        try:
+            if (bundled_root / "models" / self.model_name).is_dir():
+                app_kwargs["root"] = str(bundled_root)
+            elif (writable_root / "models" / self.model_name).is_dir():
+                app_kwargs["root"] = str(writable_root)
+            else:
+                # Prefer user's ~/.insightface if already populated and readable;
+                # otherwise store downloads under MODELS_CACHE_DIR so restricted folders work.
+                default_home_model = Path.home() / ".insightface" / "models" / self.model_name
+                try:
+                    has_default = default_home_model.is_dir()
+                except OSError:
+                    has_default = False
+                if not has_default:
+                    writable_root.mkdir(parents=True, exist_ok=True)
+                    app_kwargs["root"] = str(writable_root)
+        except OSError:
+            writable_root.mkdir(parents=True, exist_ok=True)
+            app_kwargs["root"] = str(writable_root)
 
         logger.info(
             "Initializing InsightFace (%s) with providers: %s",
             self.model_name,
             providers,
         )
-        self._app = FaceAnalysis(name=self.model_name, providers=providers)
-        self._app.prepare(
-            ctx_id=ctx_id,
-            det_thresh=self.config.det_thresh,
-            det_size=(640, 640),
-        )
+        try:
+            self._app = FaceAnalysis(
+                name=self.model_name, providers=providers, **app_kwargs
+            )
+            self._app.prepare(
+                ctx_id=ctx_id,
+                det_thresh=self.config.det_thresh,
+                det_size=(640, 640),
+            )
+        except Exception as exc:
+            if not has_gpu_provider:
+                raise
+            logger.warning(
+                "GPU initialization for InsightFace failed (%s); falling back to CPU.",
+                exc,
+            )
+            self._app = FaceAnalysis(
+                name=self.model_name,
+                providers=["CPUExecutionProvider"],
+                **app_kwargs,
+            )
+            self._app.prepare(
+                ctx_id=-1,
+                det_thresh=self.config.det_thresh,
+                det_size=(640, 640),
+            )
 
     def detect_in_image(
         self,

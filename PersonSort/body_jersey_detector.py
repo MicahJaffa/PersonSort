@@ -12,7 +12,7 @@ try:
     if hasattr(torch, "set_num_threads"):
         torch.set_num_threads(min(4, torch.get_num_threads()))
 except Exception:
-    pass
+    torch = None  # type: ignore
 
 try:
     import cv2
@@ -24,7 +24,7 @@ try:
 except ImportError:
     np = None  # type: ignore
 
-from config import SortConfig
+from config import APP_RESOURCE_DIR, MODELS_CACHE_DIR, SortConfig
 from image_loader import crop_region, load_image_bgr
 from models import BoundingBox, PlayerDetection
 
@@ -47,11 +47,21 @@ class BodyJerseyDetector:
     def __init__(self, config: SortConfig, yolo_model_name: str = "yolov8n.pt") -> None:
         self.config = config
         self.yolo_model_name = yolo_model_name
-        self._cache_dir = Path(__file__).resolve().parent / ".models_cache"
+        self._cache_dir = MODELS_CACHE_DIR
+        self._bundled_cache_dir = APP_RESOURCE_DIR / ".models_cache"
         self._yolo = None
         self._yolo_checked = False
         self._ocr_reader = None
         self._ocr_checked = False
+
+    def _has_cuda_gpu(self) -> bool:
+        """Return True only if GPU execution is enabled and CUDA is actually usable."""
+        if not self.config.use_gpu or torch is None:
+            return False
+        try:
+            return bool(torch.cuda.is_available())
+        except Exception:
+            return False
 
     def _ensure_yolo(self) -> Any:
         """Lazily load YOLOv8 person detector if `ultralytics` is installed."""
@@ -61,8 +71,12 @@ class BodyJerseyDetector:
         try:
             from ultralytics import YOLO  # type: ignore
 
-            self._cache_dir.mkdir(parents=True, exist_ok=True)
-            model_path = self._cache_dir / self.yolo_model_name
+            bundled_path = self._bundled_cache_dir / self.yolo_model_name
+            if bundled_path.is_file():
+                model_path = bundled_path
+            else:
+                self._cache_dir.mkdir(parents=True, exist_ok=True)
+                model_path = self._cache_dir / self.yolo_model_name
             self._yolo = YOLO(str(model_path))
             logger.info("Loaded YOLO person detector (%s)", model_path)
         except Exception as exc:
@@ -74,23 +88,44 @@ class BodyJerseyDetector:
         return self._yolo
 
     def _ensure_ocr(self) -> Any:
-        """Lazily load EasyOCR reader if `easyocr` is installed."""
+        """Lazily load EasyOCR reader if `easyocr` is installed, with clean CPU fallback."""
         if self._ocr_checked:
             return self._ocr_reader
         self._ocr_checked = True
         try:
             import easyocr  # type: ignore
 
-            ocr_dir = self._cache_dir / "easyocr"
-            ocr_dir.mkdir(parents=True, exist_ok=True)
-            self._ocr_reader = easyocr.Reader(
-                ["en"],
-                gpu=bool(self.config.use_gpu),
-                model_storage_directory=str(ocr_dir),
-                user_network_directory=str(ocr_dir),
-                verbose=False,
-            )
-            logger.info("Initialized EasyOCR for jersey number recognition.")
+            bundled_ocr = self._bundled_cache_dir / "easyocr"
+            if bundled_ocr.is_dir() and any(bundled_ocr.glob("*.pth")):
+                ocr_dir = bundled_ocr
+            else:
+                ocr_dir = self._cache_dir / "easyocr"
+                ocr_dir.mkdir(parents=True, exist_ok=True)
+
+            use_gpu = self._has_cuda_gpu()
+            try:
+                self._ocr_reader = easyocr.Reader(
+                    ["en"],
+                    gpu=use_gpu,
+                    model_storage_directory=str(ocr_dir),
+                    user_network_directory=str(ocr_dir),
+                    verbose=False,
+                )
+            except Exception as gpu_exc:
+                if not use_gpu:
+                    raise
+                logger.warning(
+                    "EasyOCR GPU init failed (%s); falling back cleanly to CPU.",
+                    gpu_exc,
+                )
+                self._ocr_reader = easyocr.Reader(
+                    ["en"],
+                    gpu=False,
+                    model_storage_directory=str(ocr_dir),
+                    user_network_directory=str(ocr_dir),
+                    verbose=False,
+                )
+            logger.info("Initialized EasyOCR for jersey number recognition (gpu=%s).", use_gpu)
         except Exception as exc:
             logger.info(
                 "EasyOCR ('easyocr') not available (%s); jersey OCR will be skipped until installed.",
@@ -120,6 +155,7 @@ class BodyJerseyDetector:
                 classes=[0],
                 conf=0.45,
                 imgsz=640,
+                device=0 if self._has_cuda_gpu() else "cpu",
                 verbose=False,
             )
             for res in results:

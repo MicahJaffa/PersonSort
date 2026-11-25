@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import re
 import shutil
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 
 def natural_sort_key(text: str) -> list[Any]:
@@ -25,6 +26,16 @@ try:
 except ImportError:
     np = None  # type: ignore
 
+try:
+    from PIL import Image
+except ImportError:
+    Image = None  # type: ignore
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None  # type: ignore
+
 from config import SortConfig
 from face_detector import FaceDetector, normalize_embedding
 from image_loader import crop_region, load_image_bgr, save_image_bgr, scan_images
@@ -39,35 +50,84 @@ NO_FACE_FOLDER_NAME = "No_Face_Detected"
 SINGLETONS_FOLDER_NAME = "Unclustered_Singletons"
 
 
-def _safe_copy_photo(src_path: Path, dest_dir: Path) -> Path:
+def _allocate_dest_target(dest_dir: Path, filename: str) -> Path:
+    """Return a non-colliding file path inside `dest_dir` for `filename`."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    target = dest_dir / filename
+    if target.exists():
+        stem = Path(filename).stem
+        suffix = Path(filename).suffix
+        counter = 2
+        while target.exists():
+            target = dest_dir / f"{stem}_{counter}{suffix}"
+            counter += 1
+    return target
+
+
+def _safe_export_photo(src_path: Path, dest_dir: Path, move: bool = False) -> Path:
     """
-    Copy `src_path` into `dest_dir`, preserving metadata.
-    If a different file with the same name already exists in `dest_dir`,
-    append a numeric suffix to avoid accidental overwrites.
+    Copy or move `src_path` into `dest_dir`, avoiding accidental overwrites.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     target = dest_dir / src_path.name
 
     if target.exists():
-        # If it is already the exact same size and mtime, skip re-copying
         try:
             if (
-                target.stat().st_size == src_path.stat().st_size
+                not move
+                and target.stat().st_size == src_path.stat().st_size
                 and int(target.stat().st_mtime) == int(src_path.stat().st_mtime)
             ):
                 return target
         except OSError:
             pass
+        target = _allocate_dest_target(dest_dir, src_path.name)
 
-        stem = src_path.stem
-        suffix = src_path.suffix
-        counter = 2
-        while target.exists():
-            target = dest_dir / f"{stem}_{counter}{suffix}"
-            counter += 1
-
-    shutil.copy2(src_path, target)
+    if move:
+        shutil.move(str(src_path), str(target))
+    else:
+        shutil.copy2(src_path, target)
     return target
+
+
+def _safe_copy_photo(src_path: Path, dest_dir: Path) -> Path:
+    """
+    Copy `src_path` into `dest_dir`, preserving metadata and avoiding overwrites.
+    """
+    return _safe_export_photo(src_path, dest_dir, move=False)
+
+
+def _encode_reference_crop_jpeg(profile: PlayerProfile) -> Optional[bytes]:
+    """Encode `_reference_crop.jpg` bytes in memory for `profile`, or None if unavailable."""
+    best = profile.best_detection
+    if best is None or best.face_bbox is None:
+        return None
+
+    img_bgr = load_image_bgr(best.image_path)
+    if img_bgr is None:
+        return None
+
+    crop_bgr = crop_region(img_bgr, best.face_bbox, padding_ratio=0.25)
+    if crop_bgr is None:
+        return None
+
+    if Image is not None:
+        try:
+            buf = io.BytesIO()
+            Image.fromarray(crop_bgr[:, :, ::-1]).save(buf, format="JPEG", quality=92)
+            return buf.getvalue()
+        except Exception:
+            pass
+
+    if cv2 is not None:
+        try:
+            ok, encoded = cv2.imencode(".jpg", crop_bgr)
+            if ok:
+                return encoded.tobytes()
+        except Exception:
+            pass
+
+    return None
 
 
 def save_reference_crop(profile: PlayerProfile, player_dir: Path) -> Optional[Path]:
@@ -213,13 +273,23 @@ def organize_output(
     no_face_photos: list[Path],
     total_photos_scanned: int,
     config: SortConfig,
+    *,
+    output_dir_override: Optional[Path] = None,
+    file_mode: str = "copy",
+    dropbox_manager: Optional[Any] = None,
+    dropbox_entry_by_path: Optional[dict[Path, Any]] = None,
+    dropbox_loaded_as_thumbnails: bool = False,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> dict[str, Any]:
     """
-    Copy photos into per-player folders, save `_reference_crop.jpg` thumbnails,
+    Copy or move photos into per-player folders locally, save `_reference_crop.jpg` thumbnails,
     cache player profiles (`player_profiles.npz`), and write `summary_report.json`.
+    When source photos came from Dropbox as fast thumbnails, downloads full-resolution files.
     """
-    output_dir = config.output_dir
+    output_dir = (output_dir_override or config.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    entry_map = dropbox_entry_by_path or {}
+    downloaded_full_cache: dict[Path, Path] = {}
 
     # Sort profiles in natural numerical / alphabetical order by folder_name
     sorted_profiles = sorted(
@@ -227,21 +297,74 @@ def organize_output(
         key=lambda p: natural_sort_key(p.folder_name),
     )
 
-    matched_photos_any_player: set[Path] = set()
+    matched_photos_any_player: set[Path] = {
+        photo_path for prof in sorted_profiles for photo_path in prof.photo_paths
+    }
+    singleton_photos: set[Path] = {
+        det.image_path
+        for det in unassigned_detections
+        if det.image_path not in matched_photos_any_player
+    }
+    truly_unmatched_no_face = [
+        p
+        for p in no_face_photos
+        if p not in matched_photos_any_player and p not in singleton_photos
+    ]
+
+    # Count total export operations & occurrences per source path (for safe multi-folder move)
+    occurrence_remaining: dict[Path, int] = {}
+    total_exports = 0
+    for prof in sorted_profiles:
+        for p in prof.photo_paths:
+            occurrence_remaining[p] = occurrence_remaining.get(p, 0) + 1
+            total_exports += 1
+    for p in singleton_photos:
+        occurrence_remaining[p] = occurrence_remaining.get(p, 0) + 1
+        total_exports += 1
+    for p in truly_unmatched_no_face:
+        occurrence_remaining[p] = occurrence_remaining.get(p, 0) + 1
+        total_exports += 1
+
+    completed_exports = 0
+
+    def _export_single(photo_path: Path, target_dir: Path) -> Path:
+        nonlocal completed_exports
+        is_last_occurrence = occurrence_remaining.get(photo_path, 1) <= 1
+        occurrence_remaining[photo_path] = max(0, occurrence_remaining.get(photo_path, 1) - 1)
+        should_move_local = file_mode == "move" and is_last_occurrence
+
+        entry = entry_map.get(photo_path)
+        if dropbox_loaded_as_thumbnails and dropbox_manager is not None and entry is not None:
+            if photo_path in downloaded_full_cache and downloaded_full_cache[photo_path].is_file():
+                exported = _safe_export_photo(downloaded_full_cache[photo_path], target_dir, move=False)
+            else:
+                target_path = _allocate_dest_target(target_dir, entry.name or photo_path.name)
+                dropbox_manager.download_full_file(entry, target_path)
+                downloaded_full_cache[photo_path] = target_path
+                exported = target_path
+        else:
+            exported = _safe_export_photo(photo_path, target_dir, move=should_move_local)
+
+        completed_exports += 1
+        if progress_callback:
+            progress_callback(completed_exports, max(1, total_exports), exported.name)
+        return exported
+
     player_summaries: list[dict[str, Any]] = []
+    matched_photos_exported: set[Path] = set()
 
     for prof in sorted_profiles:
         player_dir = output_dir / prof.folder_name
         player_dir.mkdir(parents=True, exist_ok=True)
 
-        copied_files: list[str] = []
-        for photo_path in sorted(prof.photo_paths, key=lambda p: natural_sort_key(p.name)):
-            copied_target = _safe_copy_photo(photo_path, player_dir)
-            copied_files.append(copied_target.name)
-            matched_photos_any_player.add(photo_path)
-
         if config.save_crops:
             save_reference_crop(prof, player_dir)
+
+        copied_files: list[str] = []
+        for photo_path in sorted(prof.photo_paths, key=lambda p: natural_sort_key(p.name)):
+            exported_target = _export_single(photo_path, player_dir)
+            copied_files.append(exported_target.name)
+            matched_photos_exported.add(photo_path)
 
         player_summaries.append(
             {
@@ -255,35 +378,25 @@ def organize_output(
             }
         )
 
-    # Copy singleton detections (when min_samples > 1) that weren't placed in any player folder
-    singleton_photos: set[Path] = {
-        det.image_path
-        for det in unassigned_detections
-        if det.image_path not in matched_photos_any_player
-    }
     if singleton_photos:
         singletons_dir = output_dir / SINGLETONS_FOLDER_NAME
-        for photo_path in sorted(singleton_photos, key=lambda p: p.name.lower()):
-            _safe_copy_photo(photo_path, singletons_dir)
+        for photo_path in sorted(singleton_photos, key=lambda p: natural_sort_key(p.name)):
+            _export_single(photo_path, singletons_dir)
 
-    # Copy photos with 0 foreground faces detected (and not matched via jersey number)
-    truly_unmatched_no_face = [
-        p
-        for p in no_face_photos
-        if p not in matched_photos_any_player and p not in singleton_photos
-    ]
     if truly_unmatched_no_face:
         no_face_dir = output_dir / NO_FACE_FOLDER_NAME
-        for photo_path in sorted(truly_unmatched_no_face, key=lambda p: p.name.lower()):
-            _safe_copy_photo(photo_path, no_face_dir)
+        for photo_path in sorted(truly_unmatched_no_face, key=lambda p: natural_sort_key(p.name)):
+            _export_single(photo_path, no_face_dir)
 
-    # Save profile cache so this output directory can be reused with --reference
     cache_path = save_profiles_cache(profiles, output_dir)
 
     summary_data: dict[str, Any] = {
+        "destination_type": "local",
+        "output_dir": str(output_dir),
+        "file_mode": file_mode,
         "total_photos_scanned": total_photos_scanned,
         "total_players_grouped": len(sorted_profiles),
-        "photos_with_grouped_players": len(matched_photos_any_player),
+        "photos_with_grouped_players": len(matched_photos_exported),
         "singleton_photos_count": len(singleton_photos),
         "no_face_photos_count": len(truly_unmatched_no_face),
         "profile_cache_file": cache_path.name if cache_path else None,
@@ -292,6 +405,164 @@ def organize_output(
 
     report_path = output_dir / SUMMARY_REPORT_FILENAME
     report_path.write_text(json.dumps(summary_data, indent=2), encoding="utf-8")
+    return summary_data
+
+
+def organize_output_to_dropbox(
+    profiles: dict[str, PlayerProfile],
+    unassigned_detections: list[PlayerDetection],
+    no_face_photos: list[Path],
+    total_photos_scanned: int,
+    config: SortConfig,
+    dropbox_manager: Any,
+    dropbox_output_folder: str,
+    *,
+    file_mode: str = "copy",
+    dropbox_entry_by_path: Optional[dict[Path, Any]] = None,
+    shared_folder_id: Optional[str] = None,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> dict[str, Any]:
+    """
+    Organize player folders directly inside Dropbox:
+    - Photos loaded from Dropbox use instant cloud-to-cloud `copy_or_move_batch(..., autorename=True)`.
+    - Photos loaded from local disk are uploaded directly into Dropbox player folders.
+    """
+    cleaned_base = (dropbox_output_folder or "").strip().replace("\\", "/").strip("/")
+    base_prefix = f"/{cleaned_base}" if cleaned_base else ""
+    display_base = base_prefix or "/"
+    entry_map = dropbox_entry_by_path or {}
+
+    if base_prefix:
+        dropbox_manager.ensure_folder(base_prefix, shared_folder_id=shared_folder_id)
+
+    sorted_profiles = sorted(
+        profiles.values(),
+        key=lambda p: natural_sort_key(p.folder_name),
+    )
+
+    matched_photos_any_player: set[Path] = {
+        photo_path for prof in sorted_profiles for photo_path in prof.photo_paths
+    }
+    singleton_photos: set[Path] = {
+        det.image_path
+        for det in unassigned_detections
+        if det.image_path not in matched_photos_any_player
+    }
+    truly_unmatched_no_face = [
+        p
+        for p in no_face_photos
+        if p not in matched_photos_any_player and p not in singleton_photos
+    ]
+
+    relocation_pairs: list[tuple[str, str]] = []
+    local_uploads: list[tuple[Path, str]] = []
+    reference_uploads: list[tuple[str, bytes]] = []
+    player_summaries: list[dict[str, Any]] = []
+
+    for prof in sorted_profiles:
+        folder_dbx_path = f"{base_prefix}/{prof.folder_name}"
+        dropbox_manager.ensure_folder(folder_dbx_path, shared_folder_id=shared_folder_id)
+
+        if config.save_crops:
+            crop_bytes = _encode_reference_crop_jpeg(prof)
+            if crop_bytes:
+                reference_uploads.append((f"{folder_dbx_path}/{REFERENCE_CROP_FILENAME}", crop_bytes))
+
+        exported_names: list[str] = []
+        for photo_path in sorted(prof.photo_paths, key=lambda p: natural_sort_key(p.name)):
+            entry = entry_map.get(photo_path)
+            if entry is not None:
+                src_ref = entry.file_id or entry.path_lower or entry.path_display
+                dest_name = entry.name or photo_path.name
+                relocation_pairs.append((src_ref, f"{folder_dbx_path}/{dest_name}"))
+                exported_names.append(dest_name)
+            else:
+                local_uploads.append((photo_path, f"{folder_dbx_path}/{photo_path.name}"))
+                exported_names.append(photo_path.name)
+
+        player_summaries.append(
+            {
+                "player_id": prof.player_id,
+                "folder_name": prof.folder_name,
+                "is_known_reference": prof.is_known_reference,
+                "photo_count": prof.photo_count,
+                "primary_jersey_number": prof.primary_jersey_number,
+                "jersey_votes": prof.jersey_votes,
+                "photos": exported_names,
+            }
+        )
+
+    def _queue_extra_bucket(paths: list[Path], bucket_name: str) -> None:
+        if not paths:
+            return
+        bucket_dbx_path = f"{base_prefix}/{bucket_name}"
+        dropbox_manager.ensure_folder(bucket_dbx_path, shared_folder_id=shared_folder_id)
+        for photo_path in sorted(paths, key=lambda p: natural_sort_key(p.name)):
+            entry = entry_map.get(photo_path)
+            if entry is not None:
+                src_ref = entry.file_id or entry.path_lower or entry.path_display
+                dest_name = entry.name or photo_path.name
+                relocation_pairs.append((src_ref, f"{bucket_dbx_path}/{dest_name}"))
+            else:
+                local_uploads.append((photo_path, f"{bucket_dbx_path}/{photo_path.name}"))
+
+    _queue_extra_bucket(list(singleton_photos), SINGLETONS_FOLDER_NAME)
+    _queue_extra_bucket(truly_unmatched_no_face, NO_FACE_FOLDER_NAME)
+
+    total_ops = max(1, len(relocation_pairs) + len(local_uploads))
+    completed = 0
+
+    if relocation_pairs:
+        def _reloc_cb(done_reloc: int, _reloc_total: int, label: str) -> None:
+            if progress_callback:
+                progress_callback(done_reloc, total_ops, label)
+
+        completed = dropbox_manager.copy_or_move_batch(
+            relocation_pairs,
+            mode=file_mode,
+            shared_folder_id=shared_folder_id,
+            progress_callback=_reloc_cb,
+        )
+
+    for local_path, dest_dbx_path in local_uploads:
+        dropbox_manager.upload_file(
+            local_path,
+            dest_dbx_path,
+            shared_folder_id=shared_folder_id,
+            autorename=True,
+        )
+        completed += 1
+        if progress_callback:
+            progress_callback(completed, total_ops, f"Uploading to Dropbox: {local_path.name}")
+
+    for crop_dest, crop_bytes in reference_uploads:
+        dropbox_manager.upload_bytes(
+            crop_bytes,
+            crop_dest,
+            shared_folder_id=shared_folder_id,
+            autorename=False,
+        )
+
+    summary_data: dict[str, Any] = {
+        "destination_type": "dropbox",
+        "output_dir": display_base,
+        "file_mode": file_mode,
+        "total_photos_scanned": total_photos_scanned,
+        "total_players_grouped": len(sorted_profiles),
+        "photos_with_grouped_players": len(matched_photos_any_player),
+        "singleton_photos_count": len(singleton_photos),
+        "no_face_photos_count": len(truly_unmatched_no_face),
+        "profile_cache_file": None,
+        "players": player_summaries,
+    }
+
+    report_bytes = json.dumps(summary_data, indent=2).encode("utf-8")
+    dropbox_manager.upload_bytes(
+        report_bytes,
+        f"{base_prefix}/{SUMMARY_REPORT_FILENAME}",
+        shared_folder_id=shared_folder_id,
+        autorename=True,
+    )
     return summary_data
 
 
