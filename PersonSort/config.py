@@ -74,10 +74,12 @@ def _load_dotenv_files() -> None:
 
 _load_dotenv_files()
 
-APP_VERSION: str = "1.0.2"
+APP_VERSION: str = "1.0.3"
 GITHUB_RELEASES_REPO: str = os.environ.get(
     "PERSONSORT_GITHUB_REPO", "MicahJaffa/PersonSort"
 ).strip()
+# Set to True to mock an available update on startup for testing the update popup and header pill.
+TEST_UPDATE: bool = False
 
 DROPBOX_APP_KEY: str = os.environ.get("PERSONSORT_DROPBOX_APP_KEY", "").strip()
 DROPBOX_SHARED_FOLDER_ID: str = os.environ.get("PERSONSORT_DROPBOX_SHARED_FOLDER_ID", "").strip()

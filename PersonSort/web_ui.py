@@ -160,6 +160,51 @@ INDEX_HTML = r"""<!DOCTYPE html>
       cursor: pointer;
     }
     .update-pill.visible { display: inline-flex; }
+    .update-pill:hover {
+      border-color: rgba(16, 185, 129, 0.9);
+      background: rgba(16, 185, 129, 0.28);
+    }
+    .update-mock-badge {
+      display: none;
+      align-items: center;
+      background: rgba(245, 158, 11, 0.18);
+      border: 1px solid rgba(245, 158, 11, 0.5);
+      color: #fcd34d;
+      font-size: 0.72rem;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 999px;
+    }
+    .update-mock-badge.visible { display: inline-flex; }
+    .update-version-compare {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 16px;
+    }
+    .update-version-col {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    .update-notes-box {
+      display: none;
+      background: #0b1120;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 0.84rem;
+      color: #cbd5e1;
+      white-space: pre-wrap;
+      max-height: 150px;
+      overflow-y: auto;
+      line-height: 1.45;
+    }
+    .update-notes-box.visible { display: block; }
     .version-tag {
       font-size: 0.78rem;
       color: var(--muted);
@@ -1418,6 +1463,45 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- ================= 7B. STARTUP UPDATE AVAILABLE POPUP ================= -->
+  <div id="update-available-modal" class="overlay-modal" style="z-index:130;" onclick="if(event.target===this) dismissUpdateModal()">
+    <div class="modal-box" style="max-width:520px; border-color:rgba(16, 185, 129, 0.55);">
+      <div class="modal-header">
+        <div style="display:flex; align-items:center; gap:8px;">
+          <strong>Update Available</strong>
+          <span id="update-modal-mock-badge" class="update-mock-badge">Test Mode</span>
+        </div>
+        <button type="button" class="btn-secondary" onclick="dismissUpdateModal()">Close (Esc)</button>
+      </div>
+      <div class="modal-body" style="gap:14px;">
+        <p id="update-modal-subtitle" style="font-size:0.96rem; line-height:1.5; color:var(--text);">
+          A new version of PersonSort is available.
+        </p>
+        <div class="update-version-compare">
+          <div class="update-version-col">
+            <span style="font-size:0.75rem; color:var(--muted);">Installed Version</span>
+            <span id="update-modal-current-ver" style="font-size:1.08rem; font-weight:700; color:#cbd5e1;">v1.0.2</span>
+          </div>
+          <span style="font-size:1.05rem; font-weight:700; color:var(--muted);">-&gt;</span>
+          <div class="update-version-col" style="text-align:right;">
+            <span style="font-size:0.75rem; color:var(--muted);">Latest Version</span>
+            <span id="update-modal-latest-ver" style="font-size:1.08rem; font-weight:700; color:#6ee7b7;">v1.0.3</span>
+          </div>
+        </div>
+        <div id="update-modal-notes" class="update-notes-box"></div>
+        <p style="font-size:0.84rem; line-height:1.5; color:var(--muted);">
+          Download and run the new installer to update PersonSort in place. Your Dropbox login and downloaded models will be preserved.
+        </p>
+        <div style="display:flex; justify-content:flex-end; gap:10px; flex-wrap:wrap; border-top:1px solid var(--border); padding-top:14px;">
+          <button type="button" class="btn-secondary" onclick="dismissUpdateModal()">Remind Me Later</button>
+          <a id="update-modal-download-btn" class="btn-commit" href="#" target="_blank" rel="noopener noreferrer" style="text-decoration:none; display:inline-flex; align-items:center;" onclick="dismissUpdateModal()">
+            Download Update
+          </a>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- ================= 8. SHUTDOWN CONFIRMATION OVERLAY ================= -->
   <div id="shutdown-overlay" class="overlay-modal" style="z-index:999;">
     <div class="modal-box" style="max-width:460px;">
@@ -1446,6 +1530,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
     let dropboxBrowserPath = '';
     let dropboxBrowserParent = null;
     let isExporting = false;
+    let activeUpdateDismissKey = '';
+    let activeUpdateIsMock = false;
 
     const urlParams = new URLSearchParams(window.location.search);
     const returnUrl = urlParams.get('return_url');
@@ -1459,6 +1545,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
       if (e.key === 'Escape') {
         if (document.getElementById('dropbox-browser-modal').classList.contains('open')) {
           closeDropboxBrowser();
+          return;
+        }
+        if (document.getElementById('update-available-modal').classList.contains('open')) {
+          dismissUpdateModal();
           return;
         }
         dismissFirstRunDropboxModal();
@@ -1524,6 +1614,60 @@ INDEX_HTML = r"""<!DOCTYPE html>
       }
     }
 
+    function showUpdateAvailableModal(info) {
+      const latestRaw = String(info.latest_version || 'latest').trim();
+      const latestDisplay = (latestRaw.startsWith('v') || latestRaw.startsWith('V'))
+        ? latestRaw
+        : `v${latestRaw}`;
+      const currentRaw = String(info.current_version || '').trim().replace(/^v/i, '');
+      const currentDisplay = currentRaw ? `v${currentRaw}` : '-';
+      const dismissKey = `ps_dismissed_update_${latestRaw || 'latest'}`;
+
+      activeUpdateDismissKey = dismissKey;
+      activeUpdateIsMock = Boolean(info.is_mock);
+
+      if (!activeUpdateIsMock && sessionStorage.getItem(dismissKey) === '1') {
+        return;
+      }
+
+      const currentEl = document.getElementById('update-modal-current-ver');
+      const latestEl = document.getElementById('update-modal-latest-ver');
+      const downloadBtn = document.getElementById('update-modal-download-btn');
+      const mockBadge = document.getElementById('update-modal-mock-badge');
+      const subtitleEl = document.getElementById('update-modal-subtitle');
+      const notesEl = document.getElementById('update-modal-notes');
+      const modalEl = document.getElementById('update-available-modal');
+
+      if (currentEl) currentEl.textContent = currentDisplay;
+      if (latestEl) latestEl.textContent = latestDisplay;
+      if (downloadBtn) downloadBtn.href = info.release_url || '#';
+      if (mockBadge) mockBadge.classList.toggle('visible', activeUpdateIsMock);
+      if (subtitleEl) {
+        const relName = String(info.release_name || '').trim();
+        subtitleEl.textContent = relName
+          ? `${relName} is ready to download.`
+          : 'A new version of PersonSort is available.';
+      }
+      if (notesEl) {
+        const notesText = String(info.release_notes || '').trim();
+        notesEl.textContent = notesText;
+        notesEl.classList.toggle('visible', Boolean(notesText));
+      }
+      if (modalEl) {
+        modalEl.classList.add('open');
+      }
+    }
+
+    function dismissUpdateModal() {
+      const el = document.getElementById('update-available-modal');
+      if (el && el.classList.contains('open')) {
+        el.classList.remove('open');
+      }
+      if (!activeUpdateIsMock && activeUpdateDismissKey) {
+        sessionStorage.setItem(activeUpdateDismissKey, '1');
+      }
+    }
+
     async function checkForUpdates() {
       try {
         const res = await fetch('/api/update-check');
@@ -1538,6 +1682,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
           btn.href = info.release_url;
           btn.textContent = `Update Available (${info.latest_version})`;
           btn.classList.add('visible');
+        }
+        if (info.update_available && info.release_url) {
+          showUpdateAvailableModal(info);
         }
       } catch (err) {
         console.debug('Update check skipped:', err);
